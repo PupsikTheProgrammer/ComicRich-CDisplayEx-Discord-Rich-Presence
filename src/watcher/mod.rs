@@ -16,4 +16,6 @@ pub enum WatchEvent {
     Focus(u32),
     /// This CDisplayEx window is gone.
     Closed(u32),
+    /// CDisplayEx wrote its registry state, as it does when leaving a comic.
+    Registry,
 }

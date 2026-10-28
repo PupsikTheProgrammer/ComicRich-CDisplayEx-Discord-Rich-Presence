@@ -1,15 +1,19 @@
 //! Reads CDisplayEx state from `HKCU\Software\CDisplayEx`.
 //!
 //! Observed behavior (1.10.33): `Comics\<N>\path` is written as soon as a file is
-//! opened for the first time; `lastpage` and `History` only when leaving a file.
-//! `History\<i>` values are `Comics` ids, most recent first.
+//! opened for the first time; `lastpage` and `History` only when leaving a file,
+//! which includes opening another one from the menu (written ~100 ms before the
+//! new file is loaded). `History\<i>` values are `Comics` ids, most recent first.
 
 use std::path::PathBuf;
+use std::time::Duration;
 
+use windows_sys::Win32::Foundation::CloseHandle;
 use windows_sys::Win32::System::Registry::{
-    RegCloseKey, RegEnumKeyExW, RegOpenKeyExW, RegQueryValueExW, HKEY, HKEY_CURRENT_USER, KEY_READ,
-    REG_DWORD, REG_EXPAND_SZ, REG_SZ,
+    RegCloseKey, RegEnumKeyExW, RegNotifyChangeKeyValue, RegOpenKeyExW, RegQueryValueExW, HKEY, HKEY_CURRENT_USER,
+    KEY_NOTIFY, KEY_READ, REG_DWORD, REG_EXPAND_SZ, REG_NOTIFY_CHANGE_LAST_SET, REG_NOTIFY_CHANGE_NAME, REG_SZ,
 };
+use windows_sys::Win32::System::Threading::{CreateEventW, WaitForSingleObject, INFINITE};
 
 use crate::win::{from_wide, wide};
 
@@ -55,6 +59,32 @@ pub fn read() -> Snapshot {
     snap
 }
 
+/// Calls `on_change` from a background thread whenever CDisplayEx writes its
+/// registry state.
+pub fn watch(on_change: impl Fn() + Send + 'static) {
+    std::thread::spawn(move || loop {
+        // The key appears when CDisplayEx first runs.
+        let Some(key) = Key::open_with(HKEY_CURRENT_USER, ROOT, KEY_NOTIFY) else {
+            std::thread::sleep(Duration::from_secs(10));
+            continue;
+        };
+        let event = unsafe { CreateEventW(std::ptr::null(), 0, 0, std::ptr::null()) };
+        if event.is_null() {
+            return;
+        }
+        loop {
+            let filter = REG_NOTIFY_CHANGE_NAME | REG_NOTIFY_CHANGE_LAST_SET;
+            if unsafe { RegNotifyChangeKeyValue(key.0, 1, filter, event, 1) } != 0 {
+                break;
+            }
+            unsafe { WaitForSingleObject(event, INFINITE) };
+            on_change();
+        }
+        unsafe { CloseHandle(event) };
+        std::thread::sleep(Duration::from_secs(1));
+    });
+}
+
 /// A string (or DWORD) value; `name` "" is the key's default value.
 pub fn read_value(root: HKEY, path: &str, name: &str) -> Option<String> {
     Key::open(root, path)?.value(name)
@@ -64,9 +94,13 @@ struct Key(HKEY);
 
 impl Key {
     fn open(parent: HKEY, sub: &str) -> Option<Key> {
+        Key::open_with(parent, sub, KEY_READ)
+    }
+
+    fn open_with(parent: HKEY, sub: &str, access: u32) -> Option<Key> {
         let sub = wide(sub);
         let mut handle: HKEY = std::ptr::null_mut();
-        let rc = unsafe { RegOpenKeyExW(parent, sub.as_ptr(), 0, KEY_READ, &mut handle) };
+        let rc = unsafe { RegOpenKeyExW(parent, sub.as_ptr(), 0, access, &mut handle) };
         (rc == 0).then_some(Key(handle))
     }
 

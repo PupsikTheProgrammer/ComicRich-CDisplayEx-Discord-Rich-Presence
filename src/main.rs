@@ -122,6 +122,11 @@ fn main() {
     let language = config.language;
     thread::spawn(move || engine::run(input_rx, presence_tx, job_tx, language));
 
+    let registry_tx = input_tx.clone();
+    watcher::registry::watch(move || {
+        let _ = registry_tx.send(Input::Watch(watcher::WatchEvent::Registry));
+    });
+
     // The window watcher needs a message loop, so it owns the main thread.
     let exit_when_idle = opened.is_some();
     watcher::run(

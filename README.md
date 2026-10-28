@@ -88,6 +88,7 @@ ComicRich запускается сам при двойном клике по к
 ## Ограничения
 
 - Если CDisplayEx открыт не двойным кликом (меню «Пуск», ярлык), ComicRich не запускается.
+  Когда ComicRich уже работает, комиксы, открытые через меню CDisplayEx, отслеживаются.
 - Discord не позволяет статус «Читает», поэтому используется ближайший тип — «Смотрит».
 - Проверено на CDisplayEx 1.10.33.
 
@@ -98,3 +99,18 @@ cargo build --release
 ```
 
 Нужны Rust (stable, MSVC) и Visual Studio Build Tools с компонентом C++ (для распаковки RAR).
+
+## Тесты
+
+```
+cargo test
+```
+
+Сквозные тесты открывают настоящие окна CDisplayEx (двойным кликом и через меню «Открыть»)
+и проверяют статус в Discord, поэтому запускаются только явно. Нужны запущенный Discord и
+`comicrich.toml` рядом с тестовой сборкой (`target\debug`):
+
+```
+set COMICRICH_E2E_COMIC=D:\Comic Books\Серия\Выпуск 01.cbz
+cargo test --test e2e -- --ignored --nocapture --test-threads=1
+```

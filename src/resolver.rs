@@ -71,16 +71,25 @@ impl Resolver {
         }
         let path = locks::command_line_comic(pid)?;
         let listing = self.listing(&path)?;
-        let saved = registry::read()
-            .comics
-            .into_iter()
-            .find(|c| c.path.as_os_str().eq_ignore_ascii_case(path.as_os_str()))
-            .and_then(|c| c.last_page)
-            .map(|p| p as usize)
-            .filter(|&p| p < listing.pages.len());
+        let saved = saved_page(&path, &listing);
         self.used_command_line.insert(pid);
         log!("resolved: command line, while CDisplayEx loads");
         Some(self.select(pid, path, listing, saved.unwrap_or(0)))
+    }
+
+    /// Another comic the window is loading, if any: one opened from the menu may
+    /// keep the title unchanged (its first page named like the current one) or
+    /// name a page the current comic has too, so it is caught by the file
+    /// CDisplayEx holds open while loading. `title` is the window's current title.
+    pub fn switched(&mut self, pid: u32, title: &str) -> Option<Resolved> {
+        let (current, _) = self.current.get(&pid)?;
+        let current = current.clone();
+        let path = locks::open_comics(pid).into_iter().find(|p| !p.as_os_str().eq_ignore_ascii_case(current.as_os_str()))?;
+        let listing = self.listing(&path)?;
+        // The title may still be the old comic's; a new one follows if the page differs.
+        let page = listing.find(title).or_else(|| saved_page(&path, &listing)).unwrap_or(0);
+        log!("resolved: window switched to another file");
+        Some(self.select(pid, path, listing, page))
     }
 
     /// The window was closed.
@@ -187,6 +196,17 @@ impl Resolver {
         self.cache.insert(path.to_path_buf(), Cached { size, modified, listing: listing.clone() });
         listing
     }
+}
+
+/// The page CDisplayEx saved for `path`, where it reopens the comic.
+fn saved_page(path: &Path, listing: &Listing) -> Option<usize> {
+    registry::read()
+        .comics
+        .into_iter()
+        .find(|c| c.path.as_os_str().eq_ignore_ascii_case(path.as_os_str()))
+        .and_then(|c| c.last_page)
+        .map(|p| p as usize)
+        .filter(|&p| p < listing.pages.len())
 }
 
 /// Most likely files first: name resembles the title, newest registry entry

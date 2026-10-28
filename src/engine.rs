@@ -7,7 +7,7 @@ use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::sync::mpsc::{Receiver, RecvTimeoutError, Sender};
 use std::sync::Arc;
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use crate::config::Language;
 use crate::meta::worker::Job;
@@ -21,6 +21,11 @@ use crate::watcher::WatchEvent;
 const RETRY_INTERVAL: Duration = Duration::from_millis(400);
 const MAX_ATTEMPTS: u32 = 10;
 const IDLE_TITLE: &str = "CDisplayEx";
+/// After CDisplayEx writes its registry, as when leaving a comic, the windows are
+/// checked this often and this long for another file being loaded (measured:
+/// written ~100 ms before the new file, which is held for ~150 ms).
+const SWITCH_POLL: Duration = Duration::from_millis(20);
+const SWITCH_WATCH: Duration = Duration::from_millis(1500);
 
 pub enum Input {
     Watch(WatchEvent),
@@ -39,6 +44,7 @@ struct Pending {
     pid: u32,
     title: String,
     attempt: u32,
+    due: Instant,
 }
 
 struct Engine {
@@ -50,6 +56,10 @@ struct Engine {
     /// Window pids, least recently used first.
     recent: Vec<u32>,
     pending: Option<Pending>,
+    /// Current title of each window.
+    titles: HashMap<u32, String>,
+    /// Until when windows are checked for a file switch.
+    watch_until: Option<Instant>,
     metas: HashMap<PathBuf, Arc<ComicMeta>>,
     requested: HashSet<PathBuf>,
     /// When reading of each open comic started (Unix seconds).
@@ -66,43 +76,86 @@ pub fn run(inputs: Receiver<Input>, presence: Sender<PresenceMsg>, jobs: Sender<
         windows: HashMap::new(),
         recent: Vec::new(),
         pending: None,
+        titles: HashMap::new(),
+        watch_until: None,
         metas: HashMap::new(),
         requested: HashSet::new(),
         started: HashMap::new(),
         showing: false,
     };
     loop {
-        let input = if engine.pending.is_some() {
-            match inputs.recv_timeout(RETRY_INTERVAL) {
+        let input = match engine.next_wake() {
+            Some(wait) => match inputs.recv_timeout(wait) {
                 Ok(i) => Some(i),
                 Err(RecvTimeoutError::Timeout) => None,
                 Err(RecvTimeoutError::Disconnected) => return,
-            }
-        } else {
-            match inputs.recv() {
+            },
+            None => match inputs.recv() {
                 Ok(i) => Some(i),
                 Err(_) => return,
-            }
+            },
         };
         match input {
             Some(Input::Watch(WatchEvent::Title { pid, title })) => engine.on_title(pid, title, 1),
             Some(Input::Watch(WatchEvent::Focus(pid))) => engine.on_focus(pid),
             Some(Input::Watch(WatchEvent::Closed(pid))) => engine.on_closed(pid),
+            Some(Input::Watch(WatchEvent::Registry)) => engine.on_registry(),
             Some(Input::Meta(path, meta)) => engine.on_meta(path, meta),
-            None => {
-                if let Some(p) = engine.pending.take() {
-                    engine.on_title(p.pid, p.title, p.attempt + 1);
-                }
-            }
+            None => engine.on_timer(),
         }
     }
 }
 
 impl Engine {
+    /// How long until a retry or a switch check is due; `None` if nothing is.
+    fn next_wake(&self) -> Option<Duration> {
+        let retry = self.pending.as_ref().map(|p| p.due.saturating_duration_since(Instant::now()));
+        let watch = self.watch_until.map(|_| SWITCH_POLL);
+        retry.into_iter().chain(watch).min()
+    }
+
+    fn on_timer(&mut self) {
+        if self.pending.as_ref().is_some_and(|p| p.due <= Instant::now()) {
+            if let Some(p) = self.pending.take() {
+                self.on_title(p.pid, p.title, p.attempt + 1);
+            }
+        }
+        if self.watch_until.is_some_and(|t| t <= Instant::now()) {
+            self.watch_until = None;
+        }
+        if self.watch_until.is_some() {
+            self.check_switches();
+        }
+    }
+
+    /// CDisplayEx wrote its registry, as it does on leaving a comic: watch the
+    /// windows showing one for a switch to another file.
+    fn on_registry(&mut self) {
+        if self.windows.values().any(|s| matches!(s, Shown::Comic(_))) {
+            self.watch_until = Some(Instant::now() + SWITCH_WATCH);
+            self.check_switches();
+        }
+    }
+
+    fn check_switches(&mut self) {
+        let pids: Vec<u32> =
+            self.windows.iter().filter(|(_, s)| matches!(s, Shown::Comic(_))).map(|(&pid, _)| pid).collect();
+        for pid in pids {
+            let title = self.titles.get(&pid).cloned().unwrap_or_default();
+            if let Some(r) = self.resolver.switched(pid, &title) {
+                self.touch(pid);
+                let shown = self.show_comic(r);
+                self.windows.insert(pid, shown);
+                self.render();
+            }
+        }
+    }
+
     fn on_title(&mut self, pid: u32, title: String, attempt: u32) {
         if self.pending.as_ref().is_some_and(|p| p.pid == pid) {
             self.pending = None;
         }
+        self.titles.insert(pid, title.clone());
         self.touch(pid);
         if title.is_empty() || title.eq_ignore_ascii_case(IDLE_TITLE) {
             // A freshly started window is still loading its command-line comic.
@@ -123,7 +176,9 @@ impl Engine {
                 self.windows.insert(pid, shown);
                 self.render();
             }
-            None if attempt < MAX_ATTEMPTS => self.pending = Some(Pending { pid, title, attempt }),
+            None if attempt < MAX_ATTEMPTS => {
+                self.pending = Some(Pending { pid, title, attempt, due: Instant::now() + RETRY_INTERVAL })
+            }
             None => {
                 log!("could not find the archive for title [{title}]");
                 self.windows.insert(pid, Shown::Unknown(title));
@@ -150,6 +205,7 @@ impl Engine {
 
     fn on_closed(&mut self, pid: u32) {
         self.windows.remove(&pid);
+        self.titles.remove(&pid);
         self.recent.retain(|&p| p != pid);
         self.resolver.forget(pid);
         if self.pending.as_ref().is_some_and(|p| p.pid == pid) {
@@ -279,6 +335,8 @@ mod tests {
             windows: HashMap::new(),
             recent: Vec::new(),
             pending: None,
+            titles: HashMap::new(),
+            watch_until: None,
             metas: HashMap::new(),
             requested: HashSet::new(),
             started: HashMap::new(),

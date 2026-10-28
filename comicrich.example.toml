@@ -1,0 +1,19 @@
+# Copy next to comicrich.exe as comicrich.toml. Every field is optional.
+
+# Discord Application ID (Developer Portal -> General Information).
+app_id = "1533059701124632717"
+
+# Language of the presence text: "ru" or "en".
+language = "ru"
+
+# Look comics up in online databases (official titles, covers, issue detection).
+online = true
+
+# https://metron.cloud — free account. Main database.
+[metron]
+username = ""
+password = ""
+
+# https://comicvine.gamespot.com/api — free API key. Fallback database.
+[comicvine]
+api_key = ""

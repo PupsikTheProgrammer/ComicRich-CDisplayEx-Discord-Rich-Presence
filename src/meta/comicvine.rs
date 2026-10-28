@@ -8,9 +8,11 @@ use serde_json::Value;
 use super::online::{pick, query, Candidate, IssueMatch, Source};
 use super::IssueRef;
 use crate::http::{encode, Host, Http};
+use crate::rate::Limit;
 
 const BASE: &str = "https://comicvine.gamespot.com/api";
-const HOST: Host = Host { key: "comicvine", gap: Duration::from_millis(1100) };
+/// Comic Vine also blocks clients that send more than about one request a second.
+const HOST: Host = Host { key: "comicvine", limit: Limit::every(Duration::from_millis(1100)) };
 
 pub struct ComicVine {
     key: String,
@@ -68,9 +70,16 @@ impl Source for ComicVine {
         "comicvine"
     }
 
-    fn issue(&mut self, http: &mut Http, series: &str, year: Option<u32>, _volume: Option<u32>, number: &str)
-        -> Option<IssueMatch>
-    {
+    // The issue request is the last one; its cover comes with the rest.
+    fn issue(
+        &mut self,
+        http: &mut Http,
+        series: &str,
+        year: Option<u32>,
+        _volume: Option<u32>,
+        number: &str,
+        _found_cover: &mut dyn FnMut(&str),
+    ) -> Option<IssueMatch> {
         let found = self.volume(http, series, year)?;
         let issue = self.find_issue(http, found.item.id, number)?;
         Some(IssueMatch {

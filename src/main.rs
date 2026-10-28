@@ -9,6 +9,7 @@ mod http;
 mod install;
 mod meta;
 mod presence;
+mod rate;
 mod resolver;
 mod watcher;
 mod win;
@@ -113,7 +114,7 @@ fn main() {
     let meta_tx = input_tx.clone();
     let worker_config = config.clone();
     thread::spawn(move || {
-        meta::worker::run(job_rx, &worker_config, |path, meta| {
+        meta::worker::run(job_rx, &worker_config, move |path, meta| {
             let _ = meta_tx.send(Input::Meta(path, meta));
         })
     });

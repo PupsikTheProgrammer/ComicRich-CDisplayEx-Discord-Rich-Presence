@@ -260,3 +260,114 @@ impl Engine {
 fn unix_now() -> u64 {
     SystemTime::now().duration_since(UNIX_EPOCH).map_or(0, |d| d.as_secs())
 }
+
+#[cfg(test)]
+mod tests {
+    use std::sync::mpsc::{self, Receiver};
+
+    use super::*;
+    use crate::archive;
+
+    fn engine() -> (Engine, Receiver<PresenceMsg>, Receiver<Job>) {
+        let (presence, presence_rx) = mpsc::channel();
+        let (jobs, jobs_rx) = mpsc::channel();
+        let engine = Engine {
+            resolver: Resolver::default(),
+            presence,
+            jobs,
+            language: Language::En,
+            windows: HashMap::new(),
+            recent: Vec::new(),
+            pending: None,
+            metas: HashMap::new(),
+            requested: HashSet::new(),
+            started: HashMap::new(),
+            showing: false,
+        };
+        (engine, presence_rx, jobs_rx)
+    }
+
+    fn comic(name: &str, page: usize) -> Resolved {
+        let path = archive::test_comic(name, 20);
+        let listing = Arc::new(archive::list(&path).unwrap());
+        Resolved { path, page, listing }
+    }
+
+    /// Simulates a window showing `r`, as `on_title` does once resolved.
+    fn open(e: &mut Engine, pid: u32, r: Resolved) {
+        e.touch(pid);
+        let shown = e.show_comic(r);
+        e.windows.insert(pid, shown);
+        e.render();
+    }
+
+    fn last(rx: &Receiver<PresenceMsg>) -> Option<Activity> {
+        match rx.try_iter().last().expect("a presence update") {
+            PresenceMsg::Set(a) => Some(a),
+            PresenceMsg::Clear => None,
+        }
+    }
+
+    #[test]
+    fn file_name_first_then_cover_from_metadata() {
+        let (mut e, presence, jobs) = engine();
+        let r = comic("Engine Cover 004.cbz", 2);
+        open(&mut e, 1, r.clone());
+
+        let a = last(&presence).unwrap();
+        assert_eq!(a.details, "Engine Cover 004");
+        assert_eq!(a.state.as_deref(), Some("Page 3 of 20"));
+        assert_eq!(a.large_image, None);
+        assert_eq!(jobs.try_iter().count(), 1);
+
+        let meta = ComicMeta {
+            kind: crate::meta::Kind::Issue,
+            title: "Engine Cover".into(),
+            number: Some("4".into()),
+            cover: Some("https://covers/4.jpg".into()),
+            ..Default::default()
+        };
+        e.on_meta(r.path.clone(), Arc::new(meta));
+        let b = last(&presence).unwrap();
+        assert_eq!(b.details, "Engine Cover #4");
+        assert_eq!(b.large_image.as_deref(), Some("https://covers/4.jpg"));
+        assert_eq!(b.start, a.start, "the reading timer keeps running");
+
+        // Page turns do not ask for metadata again.
+        open(&mut e, 1, Resolved { page: 3, ..r });
+        assert_eq!(last(&presence).unwrap().state.as_deref(), Some("Engine Cover · Page 4 of 20"));
+        assert_eq!(jobs.try_iter().count(), 0);
+    }
+
+    #[test]
+    fn metadata_for_a_background_window_changes_nothing() {
+        let (mut e, presence, _jobs) = engine();
+        let a = comic("Engine Back 001.cbz", 0);
+        open(&mut e, 1, a.clone());
+        open(&mut e, 2, comic("Engine Front 001.cbz", 0));
+        presence.try_iter().count();
+
+        e.on_meta(a.path, Arc::new(ComicMeta { title: "Back".into(), ..Default::default() }));
+        assert!(presence.try_recv().is_err());
+    }
+
+    #[test]
+    fn follows_the_last_used_window_and_clears_when_all_close() {
+        let (mut e, presence, _jobs) = engine();
+        open(&mut e, 1, comic("Engine First 001.cbz", 0));
+        open(&mut e, 2, comic("Engine Second 001.cbz", 0));
+        assert_eq!(last(&presence).unwrap().details, "Engine Second 001");
+
+        e.on_focus(1);
+        assert_eq!(last(&presence).unwrap().details, "Engine First 001");
+
+        e.on_closed(1);
+        assert_eq!(last(&presence).unwrap().details, "Engine Second 001");
+
+        e.on_closed(2);
+        assert_eq!(last(&presence), None);
+        // Nothing more to clear.
+        e.render();
+        assert!(presence.try_recv().is_err());
+    }
+}

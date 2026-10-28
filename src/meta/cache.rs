@@ -1,24 +1,37 @@
 //! Remembers metadata per file (path + size + modification time) and cover hashes
 //! per URL, so each comic is looked up online only once. Only text is stored,
 //! about 2 KB per comic. Stored in `%LOCALAPPDATA%\ComicRich\cache.json`.
+//! Database answers that many comics share, such as which series a name means,
+//! are kept for a month so the next issue of a series needs fewer requests.
 //!
 //! Pruned on start: comics whose file is gone or changed, comics not opened for
-//! a year, cover hashes no remaining comic refers to, and the least recently
-//! opened comics beyond a size cap.
+//! a year, cover hashes no remaining comic refers to, expired database answers,
+//! and the least recently opened comics beyond a size cap.
 
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
+use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use serde::{Deserialize, Serialize};
+use serde_json::Value;
 
 use super::ComicMeta;
 
 /// Bump when cached metadata would be interpreted differently.
 const VERSION: u32 = 1;
 const MAX_AGE_SECS: u64 = 365 * 24 * 3600;
+/// Series details such as issue counts change as new issues come out.
+const LOOKUP_MAX_AGE_SECS: u64 = 30 * 24 * 3600;
 /// About 5000 comics; far beyond what a year of reading leaves behind.
 const MAX_BYTES: usize = 10 << 20;
+
+/// The cache as used by the metadata threads.
+pub type Shared = Arc<Mutex<Cache>>;
+
+pub fn lock(cache: &Shared) -> MutexGuard<'_, Cache> {
+    cache.lock().unwrap_or_else(PoisonError::into_inner)
+}
 
 #[derive(Default, Serialize, Deserialize)]
 #[serde(default)]
@@ -28,8 +41,16 @@ pub struct Cache {
     covers: HashMap<String, u64>,
     /// When each comic was last opened (Unix seconds).
     used: HashMap<String, u64>,
+    lookups: HashMap<String, Lookup>,
     #[serde(skip)]
     file: Option<PathBuf>,
+}
+
+#[derive(Serialize, Deserialize)]
+struct Lookup {
+    /// When it was stored (Unix seconds).
+    at: u64,
+    value: Value,
 }
 
 impl Cache {
@@ -82,8 +103,20 @@ impl Cache {
         self.covers.insert(url, hash);
     }
 
+    /// A stored database answer, while still fresh.
+    pub fn lookup(&self, key: &str) -> Option<&Value> {
+        self.lookups.get(key).filter(|l| now().saturating_sub(l.at) < LOOKUP_MAX_AGE_SECS).map(|l| &l.value)
+    }
+
+    pub fn set_lookup(&mut self, key: String, value: Value) {
+        self.lookups.insert(key, Lookup { at: now(), value });
+    }
+
     /// Returns true if anything was removed.
     fn prune(&mut self, now: u64) -> bool {
+        let lookups = self.lookups.len();
+        self.lookups.retain(|_, l| now.saturating_sub(l.at) < LOOKUP_MAX_AGE_SECS);
+        let lookups = lookups - self.lookups.len();
         let before = (self.comics.len(), self.covers.len());
 
         for k in self.comics.keys() {
@@ -120,10 +153,10 @@ impl Cache {
         self.covers.retain(|url, _| referenced.contains(url.as_str()));
 
         let removed = (before.0 - self.comics.len(), before.1 - self.covers.len());
-        if removed != (0, 0) {
-            log!("cache: removed {} comics and {} cover hashes", removed.0, removed.1);
+        if removed != (0, 0) || lookups > 0 {
+            log!("cache: removed {} comics, {} cover hashes and {lookups} lookups", removed.0, removed.1);
         }
-        removed != (0, 0)
+        removed != (0, 0) || lookups > 0
     }
 }
 
@@ -175,5 +208,17 @@ mod tests {
         // Not opened for over a year.
         assert!(c.prune(1_000_000_000 + MAX_AGE_SECS + 1));
         assert!(c.comics.is_empty());
+    }
+
+    #[test]
+    fn lookups_expire() {
+        let mut c = Cache::default();
+        c.set_lookup("fresh".into(), Value::from(1));
+        c.lookups.insert("old".into(), Lookup { at: now() - LOOKUP_MAX_AGE_SECS - 1, value: Value::from(2) });
+        assert_eq!(c.lookup("fresh"), Some(&Value::from(1)));
+        assert_eq!(c.lookup("old"), None);
+
+        assert!(c.prune(now()));
+        assert_eq!(c.lookups.keys().collect::<Vec<_>>(), ["fresh"]);
     }
 }

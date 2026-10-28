@@ -1,24 +1,42 @@
 //! Metron (metron.cloud): free, open comic database. Needs a free account;
-//! allows about 30 requests per minute.
+//! allows about 30 requests per minute. Each request takes it a second or two,
+//! so the cover is reported as soon as the issue is found, and the series a name
+//! stands for is remembered for the following issues.
 
 use std::time::Duration;
 
+use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
+use super::cache::{self, Shared};
 use super::online::{self, pick, query, Candidate, IssueMatch, Source};
 use super::IssueRef;
 use crate::http::{basic_auth, encode, Host, Http};
+use crate::rate::Limit;
 
 const BASE: &str = "https://metron.cloud/api";
-const HOST: Host = Host { key: "metron", gap: Duration::from_millis(2100) };
+/// One lookup is a burst of up to four requests; stay under the per-minute limit.
+const HOST: Host = Host { key: "metron", limit: Limit::new(25, Duration::from_secs(60)) };
 
 pub struct Metron {
     auth: String,
+    cache: Shared,
+}
+
+/// A database series as matched to a name, with its details.
+#[derive(Serialize, Deserialize)]
+struct Series {
+    id: u64,
+    name: String,
+    year: Option<u32>,
+    volume: Option<u32>,
+    series_type: Option<String>,
+    issue_count: Option<u32>,
 }
 
 impl Metron {
-    pub fn new(user: &str, password: &str) -> Self {
-        Self { auth: basic_auth(user, password) }
+    pub fn new(user: &str, password: &str, cache: Shared) -> Self {
+        Self { auth: basic_auth(user, password), cache }
     }
 
     fn get(&self, http: &mut Http, path: &str) -> Option<Value> {
@@ -48,20 +66,46 @@ impl Source for Metron {
         "metron"
     }
 
-    fn issue(&mut self, http: &mut Http, series: &str, year: Option<u32>, volume: Option<u32>, number: &str)
-        -> Option<IssueMatch>
-    {
-        let found = self.series(http, series, year, volume)?;
-        let list = self.get(http, &format!("/issue/?series_id={}&number={}", found.item, encode(number)))?;
-        let issue_id = results(&list).first()?["id"].as_u64()?;
-        let issue = self.get(http, &format!("/issue/{issue_id}/"))?;
-        let detail = self.get(http, &format!("/series/{}/", found.item));
+    fn issue(
+        &mut self,
+        http: &mut Http,
+        series: &str,
+        year: Option<u32>,
+        volume: Option<u32>,
+        number: &str,
+        found_cover: &mut dyn FnMut(&str),
+    ) -> Option<IssueMatch> {
+        let key = format!("metron series|{}|{year:?}|{volume:?}", query(series).to_lowercase());
+        let remembered = cache::lock(&self.cache)
+            .lookup(&key)
+            .and_then(|v| serde_json::from_value::<Series>(v.clone()).ok());
+        let (mut found, remembered) = match remembered {
+            Some(s) => (s, true),
+            None => {
+                let c = self.series(http, series, year, volume)?;
+                let s = Series { id: c.item, name: c.name, year: c.year, volume: c.volume, series_type: None, issue_count: None };
+                (s, false)
+            }
+        };
 
-        let series_type = detail
-            .as_ref()
-            .and_then(|d| d["series_type"]["name"].as_str())
-            .or(issue["series"]["series_type"]["name"].as_str())
-            .map(String::from);
+        let list = self.get(http, &format!("/issue/?series_id={}&number={}", found.id, encode(number)))?;
+        let listed = results(&list).first()?;
+        if let Some(cover) = text(&listed["image"]) {
+            found_cover(&cover);
+        }
+        let issue = self.get(http, &format!("/issue/{}/", listed["id"].as_u64()?))?;
+        if !remembered {
+            if let Some(detail) = self.get(http, &format!("/series/{}/", found.id)) {
+                found.name = text(&detail["name"]).unwrap_or(found.name);
+                found.series_type = detail["series_type"]["name"].as_str().map(String::from);
+                found.issue_count = u32_of(&detail["issue_count"]);
+                if let Ok(v) = serde_json::to_value(&found) {
+                    cache::lock(&self.cache).set_lookup(key, v);
+                }
+            }
+        }
+
+        let series_type = found.series_type.or(issue["series"]["series_type"]["name"].as_str().map(String::from));
         let title = text(&issue["title"]).or_else(|| issue["name"].as_array()?.iter().find_map(text));
         let reprints = issue["reprints"]
             .as_array()
@@ -69,13 +113,13 @@ impl Source for Metron {
             .unwrap_or_default();
 
         Some(IssueMatch {
-            series: detail.as_ref().and_then(|d| text(&d["name"])).unwrap_or(found.name),
+            series: found.name,
             year: found.year,
             volume: found.volume,
             series_type,
-            issue_count: detail.as_ref().and_then(|d| u32_of(&d["issue_count"])),
+            issue_count: found.issue_count,
             title,
-            cover: text(&issue["image"]),
+            cover: text(&issue["image"]).or_else(|| text(&listed["image"])),
             reprints,
         })
     }

@@ -189,9 +189,37 @@ fn is_archive(name: &str) -> bool {
     has_extension(name, ARCHIVE_EXTENSIONS)
 }
 
+/// Writes a CBZ with `pages` blank pages to a fresh temporary folder, for tests
+/// that need a real comic file.
+#[cfg(test)]
+pub fn test_comic(name: &str, pages: usize) -> std::path::PathBuf {
+    use std::io::Write;
+    use ::zip::write::{SimpleFileOptions, ZipWriter};
+
+    let dir = std::env::temp_dir().join(format!("comicrich-test-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let path = dir.join(name);
+    let mut zip = ZipWriter::new(File::create(&path).unwrap());
+    let options = SimpleFileOptions::default().compression_method(::zip::CompressionMethod::Stored);
+    for i in 1..=pages {
+        zip.start_file(format!("{i:03}.jpg"), options).unwrap();
+        zip.write_all(b"not really a jpeg").unwrap();
+    }
+    zip.finish().unwrap();
+    path
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn lists_a_real_cbz() {
+        let path = test_comic("Listing Test 001.cbz", 12);
+        let l = list(&path).unwrap();
+        assert_eq!(l.pages.len(), 12);
+        assert_eq!(l.find("010.jpg"), Some(9));
+    }
 
     fn listing(names: &[&str]) -> Listing {
         Listing::new(names.iter().map(|s| s.to_string()).collect(), None, true)

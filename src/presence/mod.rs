@@ -1,18 +1,27 @@
-//! Owns the Discord connection: connects lazily, reconnects, and respects rate limits.
+//! Owns the Discord connection: connects at startup, reconnects, and respects
+//! rate limits.
 
 mod discord;
 pub mod format;
 
 use std::sync::mpsc::{Receiver, RecvTimeoutError};
+use std::sync::OnceLock;
 use std::time::{Duration, Instant};
 
 use crate::http::{Host, Http};
+use crate::rate::{Limit, Window};
 
-/// Discord allows about 5 activity updates per 20 seconds.
-const MIN_GAP: Duration = Duration::from_secs(4);
+/// Discord allows about 5 activity updates per 20 seconds; short bursts are fine.
+const RATE: Limit = Limit::new(5, Duration::from_secs(20));
+/// Changes arriving this close together (file name, then cached cover a few
+/// milliseconds later) go out as one update.
+const DEBOUNCE: Duration = Duration::from_millis(200);
 const RECONNECT_DELAY: Duration = Duration::from_secs(15);
 const IDLE_WAIT: Duration = Duration::from_secs(3600);
-const DISCORD_API: Host = Host { key: "discord", gap: Duration::ZERO };
+const DISCORD_API: Host = Host { key: "discord", limit: Limit::NONE };
+
+/// Application icon URL, fetched in the background at startup.
+static ICON: OnceLock<Option<String>> = OnceLock::new();
 
 #[derive(Debug, Clone, PartialEq)]
 pub struct Activity {
@@ -33,50 +42,21 @@ pub enum PresenceMsg {
 }
 
 pub fn run(app_id: String, rx: Receiver<PresenceMsg>) {
+    let icon_app = app_id.clone();
+    std::thread::spawn(move || ICON.get_or_init(|| app_icon(&icon_app)));
+
     let mut client: Option<discord::Client> = None;
-    let mut icon: Option<Option<String>> = None;
     let mut desired: Option<Activity> = None;
-    let mut sent: Option<Activity> = None;
-    let mut last_send: Option<Instant> = None;
+    // What Discord shows now, with the icon it was sent with.
+    let mut sent: Option<(Option<Activity>, Option<String>)> = None;
+    let mut sends = Window::default();
+    let mut changed_at = Instant::now();
     let mut next_connect = Instant::now();
 
     loop {
-        let now = Instant::now();
-        let dirty = desired != sent;
-        let wait = if !dirty {
-            IDLE_WAIT
-        } else if client.is_none() && now < next_connect {
-            next_connect - now
-        } else {
-            last_send.map_or(Duration::ZERO, |t| MIN_GAP.saturating_sub(t.elapsed()))
-        };
-
-        match rx.recv_timeout(wait) {
-            Ok(msg) => {
-                desired = apply(msg);
-                // Coalesce bursts of page turns into one update.
-                while let Ok(msg) = rx.try_recv() {
-                    desired = apply(msg);
-                }
-                continue;
-            }
-            Err(RecvTimeoutError::Timeout) => {}
-            Err(RecvTimeoutError::Disconnected) => return,
-        }
-        if desired == sent || last_send.is_some_and(|t| t.elapsed() < MIN_GAP) {
-            continue;
-        }
-
-        // The connection stays open between comics: a fresh handshake can take
-        // Discord several seconds to answer.
-        if client.is_none() {
-            if desired.is_none() {
-                sent = None;
-                continue;
-            }
-            if Instant::now() < next_connect {
-                continue;
-            }
+        // Connect right away, while CDisplayEx is still loading the comic; the
+        // connection then stays open, since a handshake can take Discord seconds.
+        if client.is_none() && Instant::now() >= next_connect {
             match discord::Client::connect(&app_id) {
                 Ok(c) => {
                     log!("connected to Discord");
@@ -85,25 +65,52 @@ pub fn run(app_id: String, rx: Receiver<PresenceMsg>) {
                 Err(e) => {
                     log!("Discord unavailable: {e}");
                     next_connect = Instant::now() + RECONNECT_DELAY;
-                    continue;
                 }
             }
         }
-        let icon = icon.get_or_insert_with(|| app_icon(&app_id));
 
-        let Some(c) = client.as_mut() else { continue };
-        last_send = Some(Instant::now());
-        match c.set_activity(desired.as_ref(), icon.as_deref()) {
-            Ok(()) => {
-                log!("presence updated: {desired:?}");
-                sent = desired.clone();
+        // An icon arriving after the first update is sent along on its own.
+        let icon = ICON.get().cloned().flatten().filter(|_| desired.is_some());
+        let target = (desired.clone(), icon.clone());
+        let dirty = sent.as_ref() != Some(&target) && !(sent.is_none() && desired.is_none());
+
+        let ready_in = sends.wait(RATE, Instant::now()).max(DEBOUNCE.saturating_sub(changed_at.elapsed()));
+
+        let wait = match &client {
+            Some(_) if dirty && ready_in.is_zero() => {
+                let c = client.as_mut().unwrap();
+                sends.record(Instant::now());
+                match c.set_activity(desired.as_ref(), icon.as_deref()) {
+                    Ok(()) => {
+                        log!("presence updated: {desired:?}");
+                        sent = Some(target);
+                    }
+                    Err(e) => {
+                        log!("Discord connection lost: {e}");
+                        client = None;
+                        sent = None;
+                        next_connect = Instant::now() + Duration::from_secs(2);
+                    }
+                }
+                continue;
             }
-            Err(e) => {
-                log!("Discord connection lost: {e}");
-                client = None;
-                sent = None;
-                next_connect = Instant::now() + Duration::from_secs(2);
+            Some(_) if dirty => ready_in,
+            None => next_connect.saturating_duration_since(Instant::now()),
+            // Wake up for the icon if it is still being fetched.
+            Some(_) if ICON.get().is_none() => DEBOUNCE,
+            Some(_) => IDLE_WAIT,
+        };
+
+        match rx.recv_timeout(wait) {
+            Ok(msg) => {
+                desired = apply(msg);
+                while let Ok(msg) = rx.try_recv() {
+                    desired = apply(msg);
+                }
+                changed_at = Instant::now();
             }
+            Err(RecvTimeoutError::Timeout) => {}
+            Err(RecvTimeoutError::Disconnected) => return,
         }
     }
 }

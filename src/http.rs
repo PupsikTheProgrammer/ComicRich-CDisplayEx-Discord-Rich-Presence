@@ -1,4 +1,4 @@
-//! Blocking HTTP with per-host pacing, used only from the background metadata thread.
+//! Blocking HTTP with per-host rate limits, used only from background threads.
 
 use std::collections::HashMap;
 use std::io::Read;
@@ -6,26 +6,39 @@ use std::time::{Duration, Instant};
 
 use serde_json::Value;
 
+use crate::rate::{Limit, Window};
+
 const USER_AGENT: &str = concat!("ComicRich/", env!("CARGO_PKG_VERSION"), " (CDisplayEx Discord presence)");
 const TIMEOUT: Duration = Duration::from_secs(20);
+/// A reachable server connects in well under a second; without this an
+/// unreachable one holds every lookup for Windows' 21 s connect timeout.
+const CONNECT_TIMEOUT: Duration = Duration::from_secs(3);
+/// How long an unreachable host is skipped, so lookups go straight to the next source.
+const DOWN_FOR: Duration = Duration::from_secs(300);
 const MAX_RETRY_WAIT: u64 = 60;
 
 pub struct Http {
     agent: ureq::Agent,
-    last: HashMap<&'static str, Instant>,
+    windows: HashMap<&'static str, Window>,
+    /// Unreachable hosts and when to try them again.
+    down: HashMap<&'static str, Instant>,
 }
 
-/// A host and the minimum delay between requests to it.
+/// A host and how many requests it accepts.
 #[derive(Clone, Copy)]
 pub struct Host {
     pub key: &'static str,
-    pub gap: Duration,
+    pub limit: Limit,
 }
 
 impl Http {
     pub fn new() -> Self {
-        let agent = ureq::AgentBuilder::new().timeout(TIMEOUT).user_agent(USER_AGENT).build();
-        Self { agent, last: HashMap::new() }
+        let agent = ureq::AgentBuilder::new()
+            .timeout(TIMEOUT)
+            .timeout_connect(CONNECT_TIMEOUT)
+            .user_agent(USER_AGENT)
+            .build();
+        Self { agent, windows: HashMap::new(), down: HashMap::new() }
     }
 
     pub fn json(&mut self, host: Host, url: &str, auth: Option<&str>) -> Option<Value> {
@@ -41,6 +54,9 @@ impl Http {
     }
 
     fn call(&mut self, host: Host, url: &str, auth: Option<&str>) -> Option<ureq::Response> {
+        if self.down.get(host.key).is_some_and(|&until| Instant::now() < until) {
+            return None;
+        }
         for attempt in 0..2 {
             self.pace(host);
             let mut request = self.agent.get(url);
@@ -54,6 +70,13 @@ impl Http {
                     log!("rate limited by {}, waiting {wait}s", host.key);
                     std::thread::sleep(Duration::from_secs(wait.min(MAX_RETRY_WAIT)));
                 }
+                Err(ureq::Error::Transport(t))
+                    if matches!(t.kind(), ureq::ErrorKind::Dns | ureq::ErrorKind::ConnectionFailed | ureq::ErrorKind::Io) =>
+                {
+                    log!("{} unreachable ({t}), skipping it for {DOWN_FOR:?}", host.key);
+                    self.down.insert(host.key, Instant::now() + DOWN_FOR);
+                    return None;
+                }
                 Err(e) => {
                     log!("request failed {}: {e}", redact(url));
                     return None;
@@ -64,12 +87,12 @@ impl Http {
     }
 
     fn pace(&mut self, host: Host) {
-        if let Some(last) = self.last.get(host.key) {
-            if let Some(wait) = host.gap.checked_sub(last.elapsed()) {
-                std::thread::sleep(wait);
-            }
+        let window = self.windows.entry(host.key).or_default();
+        let wait = window.wait(host.limit, Instant::now());
+        if !wait.is_zero() {
+            std::thread::sleep(wait);
         }
-        self.last.insert(host.key, Instant::now());
+        window.record(Instant::now());
     }
 }
 
@@ -127,5 +150,31 @@ mod tests {
     fn encodes_and_redacts() {
         assert_eq!(encode("Doctor Strange/Avengers"), "Doctor%20Strange%2FAvengers");
         assert_eq!(redact("https://x/?api_key=SECRET&format=json"), "https://x/?api_key=***&format=json");
+    }
+
+    #[test]
+    fn unreachable_host_is_skipped() {
+        // Nothing listens on port 1: the connection is refused at once.
+        let host = Host { key: "nowhere", limit: Limit::NONE };
+        let mut http = Http::new();
+        assert!(http.json(host, "http://127.0.0.1:1/", None).is_none());
+        assert!(http.down.contains_key("nowhere"));
+
+        let started = Instant::now();
+        assert!(http.json(host, "http://127.0.0.1:1/", None).is_none());
+        assert!(started.elapsed() < Duration::from_millis(50), "second request was attempted");
+        // Other hosts are unaffected.
+        assert!(!http.down.contains_key("other"));
+    }
+
+    #[test]
+    fn bursts_are_not_spaced_out() {
+        let host = Host { key: "burst", limit: Limit::new(3, Duration::from_secs(60)) };
+        let mut http = Http::new();
+        let started = Instant::now();
+        for _ in 0..3 {
+            http.pace(host);
+        }
+        assert!(started.elapsed() < Duration::from_millis(50));
     }
 }

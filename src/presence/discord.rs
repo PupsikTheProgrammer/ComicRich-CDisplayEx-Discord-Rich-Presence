@@ -123,3 +123,44 @@ fn clamp(s: &str) -> String {
     }
     out
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn activity(cover: Option<&str>) -> Activity {
+        Activity {
+            details: "Runaways #7".into(),
+            state: Some("Page 1 of 24".into()),
+            large_image: cover.map(String::from),
+            large_text: "Runaways #7".into(),
+            small_image: None,
+            small_text: None,
+            start: 1_700_000_000,
+        }
+    }
+
+    #[test]
+    fn cover_is_large_and_icon_is_the_badge() {
+        let v = activity_json(&activity(Some("https://covers/7.jpg")), Some("https://icon.png"));
+        assert_eq!(v["assets"]["large_image"], "https://covers/7.jpg");
+        assert_eq!(v["assets"]["small_image"], "https://icon.png");
+        assert_eq!(v["details"], "Runaways #7");
+        assert_eq!(v["timestamps"]["start"], 1_700_000_000);
+    }
+
+    #[test]
+    fn icon_stands_in_for_a_missing_cover() {
+        let v = activity_json(&activity(None), Some("https://icon.png"));
+        assert_eq!(v["assets"]["large_image"], "https://icon.png");
+        assert!(v["assets"].get("small_image").is_none());
+        // Before the icon is known there are no images at all.
+        assert!(activity_json(&activity(None), None).get("assets").is_none());
+    }
+
+    #[test]
+    fn texts_fit_discord_limits() {
+        assert_eq!(clamp("x"), "x ");
+        assert_eq!(clamp(&"я".repeat(200)).chars().count(), MAX_TEXT);
+    }
+}

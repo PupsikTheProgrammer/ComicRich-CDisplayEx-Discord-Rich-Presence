@@ -23,10 +23,19 @@ pub struct IssueMatch {
     pub reprints: Vec<IssueRef>,
 }
 
-pub trait Source {
+pub trait Source: Send {
     fn name(&self) -> &'static str;
-    fn issue(&mut self, http: &mut Http, series: &str, year: Option<u32>, volume: Option<u32>, number: &str)
-        -> Option<IssueMatch>;
+    /// `found_cover` gets the cover URL as soon as it is known, before the rest
+    /// of the details have been fetched.
+    fn issue(
+        &mut self,
+        http: &mut Http,
+        series: &str,
+        year: Option<u32>,
+        volume: Option<u32>,
+        number: &str,
+        found_cover: &mut dyn FnMut(&str),
+    ) -> Option<IssueMatch>;
     fn cover(&mut self, http: &mut Http, issue: &IssueRef) -> Option<String>;
 }
 

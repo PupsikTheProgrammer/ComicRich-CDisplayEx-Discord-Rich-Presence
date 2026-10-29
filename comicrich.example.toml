@@ -1,22 +1,23 @@
-# Copy next to comicrich.exe as comicrich.toml. Every field is optional.
+# ComicRich settings. Every field is optional; changes apply the next time you
+# open a comic.
 
-# Discord Application ID (Developer Portal -> General Information).
+# Discord application whose name and icon your status shows
+# (Discord Developer Portal -> your application -> General Information).
 app_id = "1533059701124632717"
 
-# Language of the presence text: "ru" or "en".
-language = "ru"
+# Language of the status text: "en" or "ru".
+language = "en"
 
-# Look comics up in online databases (official titles, covers, issue detection).
+# Look comics up in online databases for official titles, covers and the
+# issues inside collected editions.
 online = true
 
-# https://metron.cloud — free account. Main database.
-# Preferred: an API token (account page -> API Tokens). Username and password
-# still work but are deprecated by Metron.
+# https://metron.cloud — main database, free account.
+# Create a token on your account page, section "API Tokens".
+# (username and password still work instead, but Metron has deprecated them.)
 [metron]
 token = ""
-username = ""
-password = ""
 
-# https://comicvine.gamespot.com/api — free API key. Fallback database.
+# https://comicvine.gamespot.com/api — fallback database, free API key.
 [comicvine]
 api_key = ""

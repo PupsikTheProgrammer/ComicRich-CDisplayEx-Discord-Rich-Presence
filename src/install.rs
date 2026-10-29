@@ -5,14 +5,16 @@
 //! per-user override of just that command, pointing at `comicrich.exe --open`,
 //! which starts CDisplayEx itself. Icons and thumbnails stay CDisplayEx's, no
 //! administrator rights are needed, and uninstalling deletes the override so the
-//! original command applies again.
+//! original command applies again. ComicRich is also listed under Settings → Apps
+//! → Installed apps, from where it can be uninstalled like any program.
 
+use std::os::windows::process::CommandExt;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
 use windows_sys::Win32::System::Registry::{
     RegCloseKey, RegCreateKeyExW, RegDeleteKeyW, RegOpenKeyExW, RegQueryInfoKeyW, RegSetValueExW, HKEY,
-    HKEY_CLASSES_ROOT, HKEY_CURRENT_USER, HKEY_LOCAL_MACHINE, KEY_READ, KEY_WRITE, REG_SZ,
+    HKEY_CLASSES_ROOT, HKEY_CURRENT_USER, HKEY_LOCAL_MACHINE, KEY_READ, KEY_WRITE, REG_DWORD, REG_SZ,
 };
 use windows_sys::Win32::UI::Shell::{SHChangeNotify, SHCNE_ASSOCCHANGED, SHCNF_IDLIST};
 
@@ -21,8 +23,13 @@ use crate::win::wide;
 
 const EXTENSIONS: &[&str] = &[".cbz", ".cbr", ".cb7"];
 const EXE_NAME: &str = "comicrich.exe";
+/// Where an update moves the previous program, which may still be running.
+const OLD_EXE_NAME: &str = "comicrich.old.exe";
 const CONFIG_NAME: &str = "comicrich.toml";
+const CONFIG_TEMPLATE: &str = include_str!("../comicrich.example.toml");
 const MARKER: &str = "--open";
+const UNINSTALL_KEY: &str = r"Software\Microsoft\Windows\CurrentVersion\Uninstall\ComicRich";
+const CREATE_NO_WINDOW: u32 = 0x0800_0000;
 
 /// ProgIDs of comic extensions whose machine-wide command starts CDisplayEx.
 fn cdisplayex_prog_ids() -> Vec<String> {
@@ -67,12 +74,28 @@ fn install_dir() -> Result<PathBuf, String> {
         .ok_or_else(|| "LOCALAPPDATA is not set".to_string())
 }
 
-/// Copies the program (and its config) to a stable place and takes over
-/// double-clicks on comics. Returns a report for the user.
+/// The installed program, if double-clicks on comics start it.
+pub fn installed_exe() -> Option<PathBuf> {
+    let exe = install_dir().ok()?.join(EXE_NAME);
+    let hooked = cdisplayex_prog_ids().iter().any(|id| ours(id));
+    (hooked && exe.is_file()).then_some(exe)
+}
+
+pub fn settings_path() -> Option<PathBuf> {
+    Some(install_dir().ok()?.join(CONFIG_NAME))
+}
+
+/// Whether `prog_id`'s open command is ComicRich's override.
+fn ours(prog_id: &str) -> bool {
+    read_value(HKEY_CURRENT_USER, &command_key(prog_id), "").is_some_and(|c| c.to_lowercase().contains(EXE_NAME))
+}
+
+/// Copies the program to a stable place, creates its settings, takes over
+/// double-clicks on comics and lists it among installed apps. Returns a report.
 pub fn install() -> Result<String, String> {
     let ids = cdisplayex_prog_ids();
     if ids.is_empty() {
-        return Err("CDisplayEx is not registered for .cbz/.cbr files; install or repair CDisplayEx first".into());
+        return Err("CDisplayEx is not registered for .cbz/.cbr files. Install or repair CDisplayEx first.".into());
     }
     let dir = install_dir()?;
     std::fs::create_dir_all(&dir).map_err(|e| format!("cannot create {}: {e}", dir.display()))?;
@@ -81,37 +104,92 @@ pub fn install() -> Result<String, String> {
     let mut report = Vec::new();
 
     if !same_file(&current, &target) {
-        std::fs::copy(&current, &target).map_err(|e| {
-            format!("cannot copy to {}: {e} (close any running ComicRich and try again)", target.display())
-        })?;
+        replace_exe(&current, &target)?;
         report.push(format!("program copied to {}", target.display()));
-        let config = current.with_file_name(CONFIG_NAME);
-        let target_config = dir.join(CONFIG_NAME);
-        if config.is_file() && !target_config.exists() {
-            std::fs::copy(&config, &target_config).map_err(|e| e.to_string())?;
-            report.push(format!("settings copied to {}", target_config.display()));
-        }
+    }
+    let config = dir.join(CONFIG_NAME);
+    if !config.exists() {
+        // Settings next to the downloaded program are taken along; otherwise defaults.
+        let beside = current.with_file_name(CONFIG_NAME);
+        let result = if beside.is_file() { std::fs::copy(&beside, &config).map(|_| ()) } else { std::fs::write(&config, CONFIG_TEMPLATE) };
+        result.map_err(|e| format!("cannot create {}: {e}", config.display()))?;
+        report.push(format!("settings created at {}", config.display()));
     }
 
     let command = format!("\"{}\" {MARKER} \"%1\"", target.display());
     for id in &ids {
-        set_default_value(&command_key(id), &command)?;
+        set_values(&command_key(id), &[("", Value::Text(&command))])?;
         report.push(format!("double-click on {id} files now starts ComicRich"));
     }
+    register_app(&dir, &target)?;
     notify_shell();
     Ok(report.join("\n"))
+}
+
+/// Puts `source` at `target`. A running ComicRich keeps its file open, but Windows
+/// lets a running program's file be renamed, so the old one is moved aside first.
+fn replace_exe(source: &Path, target: &Path) -> Result<(), String> {
+    let old = target.with_file_name(OLD_EXE_NAME);
+    let _ = std::fs::remove_file(&old);
+    if target.exists() {
+        let _ = std::fs::rename(target, &old);
+    }
+    std::fs::copy(source, target)
+        .map_err(|e| format!("cannot copy to {}: {e}. Close CDisplayEx, wait 15 seconds and try again.", target.display()))?;
+    // Still running, it stays until the next update or uninstall.
+    let _ = std::fs::remove_file(&old);
+    Ok(())
+}
+
+/// The entry under Settings → Apps → Installed apps.
+fn register_app(dir: &Path, exe: &Path) -> Result<(), String> {
+    let exe_text = exe.display().to_string();
+    let uninstall = format!("\"{exe_text}\" --uninstall --gui");
+    let quiet = format!("\"{exe_text}\" --uninstall");
+    let size_kb = std::fs::metadata(exe).map_or(0, |m| (m.len() / 1024) as u32);
+    set_values(
+        UNINSTALL_KEY,
+        &[
+            ("DisplayName", Value::Text("ComicRich")),
+            ("DisplayVersion", Value::Text(env!("CARGO_PKG_VERSION"))),
+            ("Publisher", Value::Text("ComicRich")),
+            ("DisplayIcon", Value::Text(&exe_text)),
+            ("InstallLocation", Value::Text(&dir.display().to_string())),
+            ("UninstallString", Value::Text(&uninstall)),
+            ("QuietUninstallString", Value::Text(&quiet)),
+            ("EstimatedSize", Value::Number(size_kb)),
+            ("NoModify", Value::Number(1)),
+            ("NoRepair", Value::Number(1)),
+        ],
+    )
+}
+
+/// Deletes the program, and with `everything` also its settings and cache, a
+/// moment after this process exits (a running program cannot delete itself).
+pub fn remove_files(everything: bool) {
+    let Ok(dir) = install_dir() else { return };
+    let targets = if everything {
+        format!("rmdir /s /q \"{}\"", dir.display())
+    } else {
+        format!("del /f /q \"{}\" \"{}\"", dir.join(EXE_NAME).display(), dir.join(OLD_EXE_NAME).display())
+    };
+    let _ = Command::new("cmd")
+        .raw_arg(format!("/c ping -n 3 127.0.0.1 >nul & {targets}"))
+        .creation_flags(CREATE_NO_WINDOW)
+        .spawn();
 }
 
 /// Restores CDisplayEx as the direct handler of comic files.
 pub fn uninstall() -> Result<String, String> {
     let mut report = Vec::new();
+    if delete_key(UNINSTALL_KEY).is_ok() {
+        report.push("removed from installed apps".to_string());
+    }
     for id in cdisplayex_prog_ids() {
-        let key = command_key(&id);
-        let ours = read_value(HKEY_CURRENT_USER, &key, "").is_some_and(|c| c.to_lowercase().contains(EXE_NAME));
-        if !ours {
+        if !ours(&id) {
             continue;
         }
-        delete_key(&key)?;
+        delete_key(&command_key(&id))?;
         // Remove the parents we created, but only while they hold nothing else.
         for parent in [format!(r"Software\Classes\{id}\shell\open"), format!(r"Software\Classes\{id}\shell"), format!(r"Software\Classes\{id}")] {
             if !delete_if_empty(&parent) {
@@ -136,9 +214,14 @@ fn same_file(a: &Path, b: &Path) -> bool {
     }
 }
 
-fn set_default_value(path: &str, value: &str) -> Result<(), String> {
+enum Value<'a> {
+    Text(&'a str),
+    Number(u32),
+}
+
+/// Creates `HKCU\path` if needed and writes the values; the name "" is the default value.
+fn set_values(path: &str, values: &[(&str, Value)]) -> Result<(), String> {
     let wpath = wide(path);
-    let data = wide(value);
     unsafe {
         let mut key: HKEY = std::ptr::null_mut();
         let rc = RegCreateKeyExW(
@@ -155,11 +238,21 @@ fn set_default_value(path: &str, value: &str) -> Result<(), String> {
         if rc != 0 {
             return Err(format!("cannot create HKCU\\{path}: error {rc}"));
         }
-        let rc = RegSetValueExW(key, std::ptr::null(), 0, REG_SZ, data.as_ptr().cast(), (data.len() * 2) as u32);
-        RegCloseKey(key);
-        if rc != 0 {
-            return Err(format!("cannot write HKCU\\{path}: error {rc}"));
+        for (name, value) in values {
+            let name = wide(name);
+            let rc = match value {
+                Value::Text(s) => {
+                    let data = wide(s);
+                    RegSetValueExW(key, name.as_ptr(), 0, REG_SZ, data.as_ptr().cast(), (data.len() * 2) as u32)
+                }
+                Value::Number(n) => RegSetValueExW(key, name.as_ptr(), 0, REG_DWORD, n.to_le_bytes().as_ptr(), 4),
+            };
+            if rc != 0 {
+                RegCloseKey(key);
+                return Err(format!("cannot write HKCU\\{path}: error {rc}"));
+            }
         }
+        RegCloseKey(key);
     }
     Ok(())
 }

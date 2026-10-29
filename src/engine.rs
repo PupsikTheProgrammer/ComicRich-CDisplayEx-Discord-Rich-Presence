@@ -14,7 +14,7 @@ use crate::meta::worker::Job;
 use crate::meta::{filename, ComicMeta};
 use crate::presence::{format, Activity, PresenceMsg};
 use crate::resolver::{Resolved, Resolver};
-use crate::watcher::WatchEvent;
+use crate::watcher::{locks, WatchEvent};
 
 /// CDisplayEx may update the title a few milliseconds before writing the registry,
 /// so an unresolved title is retried for a while.
@@ -183,7 +183,13 @@ impl Engine {
             }
             None => {
                 log!("could not find the archive for title [{title}]");
-                self.windows.insert(pid, Shown::Unknown(title));
+                // A double-clicked file in a format that cannot be read (e.g. CB7)
+                // is at least shown by its name.
+                let shown = match locks::command_line_comic(pid) {
+                    Some(path) => path.to_string_lossy().into_owned(),
+                    None => title,
+                };
+                self.windows.insert(pid, Shown::Unknown(shown));
                 self.render();
             }
         }
@@ -300,8 +306,10 @@ impl Engine {
         }
     }
 
+    /// `title` is a window title (the comic's name is its first component, for
+    /// archives inside archives) or the full path of an unreadable file.
     fn unknown_activity(&mut self, title: &str) -> Activity {
-        let first = title.split(['\\', '/']).next().unwrap_or(title);
+        let first = if Path::new(title).is_absolute() { title } else { title.split(['\\', '/']).next().unwrap_or(title) };
         let name = filename::clean(first.as_ref());
         Activity {
             details: format::reading_line(self.language).to_string(),
@@ -397,6 +405,15 @@ mod tests {
         open(&mut e, 1, Resolved { page: 3, ..r });
         assert_eq!(last(&presence).unwrap().state.as_deref(), Some("Engine Cover · Page 4 of 20"));
         assert_eq!(jobs.try_iter().count(), 0);
+    }
+
+    #[test]
+    fn unidentified_comics_are_named_by_file() {
+        let (mut e, _presence, _jobs) = engine();
+        // An unreadable double-clicked file: its path.
+        assert_eq!(e.unknown_activity(r"D:\Comics\Saga 012 (2013) (Digital).cb7").state.as_deref(), Some("Saga 012 (2013)"));
+        // A window title: the archive inside the archive, not the page.
+        assert_eq!(e.unknown_activity(r"Saga 012.cbr\page 003.jpg").state.as_deref(), Some("Saga 012"));
     }
 
     #[test]

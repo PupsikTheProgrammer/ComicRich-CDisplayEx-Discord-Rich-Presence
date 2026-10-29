@@ -11,8 +11,8 @@ const FILE_NAME: &str = "comicrich.toml";
 #[serde(rename_all = "lowercase")]
 pub enum Language {
     #[default]
-    Ru,
     En,
+    Ru,
 }
 
 #[derive(Clone, Debug, Deserialize)]
@@ -92,6 +92,16 @@ impl Config {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn settings_template_is_valid() {
+        // Installing writes this file as the settings of every new user.
+        let config: Config = toml::from_str(include_str!("../comicrich.example.toml")).unwrap();
+        assert_eq!(config.app_id, DEFAULT_APP_ID);
+        assert!(matches!(config.language, Language::En));
+        assert!(config.online);
+        assert_eq!(config.metron.authorization(), None);
+    }
 
     #[test]
     fn metron_token_wins_over_password() {

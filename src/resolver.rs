@@ -4,7 +4,9 @@
 //! history and are confirmed by checking that the archive actually contains the image.
 //! Page names like `001.jpg` exist in many archives, so a switch to another file is
 //! settled by stronger evidence first: the file CDisplayEx holds open while loading,
-//! then a registry entry created by a first-time open.
+//! then a registry entry created by a first-time open. A file opened from the menu
+//! may not change the title at all; `switched` finds it while it is being loaded,
+//! after CDisplayEx records the comic it left in the registry.
 
 use std::cmp::Reverse;
 use std::collections::{HashMap, HashSet};

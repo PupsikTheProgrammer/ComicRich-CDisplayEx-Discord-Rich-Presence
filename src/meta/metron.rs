@@ -1,8 +1,9 @@
 //! Metron (metron.cloud): free, open comic database. Needs a free account; allows
 //! 20 requests per minute and 5000 per day per user, and reports what is left in
-//! every response (followed by `Http`). Each request takes it a second or two,
-//! so the cover is reported as soon as the issue is found, and the series a name
-//! stands for is remembered for the following issues.
+//! every response (followed by `Http`). A request takes it a few hundred
+//! milliseconds with a token and a second or two with a password, so the cover
+//! is reported as soon as the issue is found, and the series a name stands for
+//! is remembered for the following issues.
 
 use std::time::Duration;
 

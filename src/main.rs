@@ -11,6 +11,7 @@ mod meta;
 mod presence;
 mod rate;
 mod resolver;
+mod setup;
 mod watcher;
 mod win;
 
@@ -62,6 +63,16 @@ fn main() {
         })
         .join()
         .unwrap();
+        return;
+    }
+    if args.len() == 1 {
+        // A double-click on the program itself: install, update or open the settings.
+        setup::run();
+        return;
+    }
+    if args.iter().any(|a| a == "--uninstall") && args.iter().any(|a| a == "--gui") {
+        // Uninstalling from Settings → Apps → Installed apps.
+        setup::uninstall();
         return;
     }
     for (flag, action) in [("--install", install::install as fn() -> _), ("--uninstall", install::uninstall)] {

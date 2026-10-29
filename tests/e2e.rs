@@ -267,6 +267,7 @@ struct App {
     log_path: PathBuf,
     started: Instant,
     bookmarks: Vec<(String, String)>,
+    closed: bool,
 }
 
 impl App {
@@ -281,7 +282,7 @@ impl App {
             .env("COMICRICH_LOG", &log_path)
             .spawn()
             .expect("start comicrich");
-        App { child, log_path, started, bookmarks }
+        App { child, log_path, started, bookmarks, closed: false }
     }
 
     fn log(&self) -> String {
@@ -325,6 +326,19 @@ impl App {
 
     /// Closes CDisplayEx and ComicRich, restores the bookmarks; prints and returns the log.
     fn close(mut self, label: &str) -> String {
+        self.shut_down();
+        let log = self.log();
+        println!("--- {label}:");
+        for line in log.lines() {
+            println!("    {}", line.chars().take(200).collect::<String>());
+        }
+        log
+    }
+
+    fn shut_down(&mut self) {
+        if std::mem::replace(&mut self.closed, true) {
+            return;
+        }
         let pids = self.cdisplayex_pids();
         for &pid in &pids {
             ui::close(pid);
@@ -334,12 +348,13 @@ impl App {
         let _ = self.child.wait();
         // Discord is slow to accept a connection right after one closed.
         std::thread::sleep(Duration::from_secs(2));
-        let log = self.log();
-        println!("--- {label}:");
-        for line in log.lines() {
-            println!("    {}", line.chars().take(200).collect::<String>());
-        }
-        log
+    }
+}
+
+/// A failed test still closes its windows and restores the bookmarks.
+impl Drop for App {
+    fn drop(&mut self) {
+        self.shut_down();
     }
 }
 
@@ -455,14 +470,18 @@ mod ui {
         let _ = Command::new("taskkill").args(["/PID", &pid.to_string()]).output();
     }
 
+    /// Windows may refuse to bring the window forward while the user works in
+    /// another one, so the key press is retried.
     pub fn show_open_dialog(window: HWND, pid: u32) -> Option<HWND> {
-        press(window, VK_L);
-        let deadline = Instant::now() + Duration::from_secs(3);
-        while Instant::now() < deadline {
-            if let Some(dialog) = self::window(pid, "#32770") {
-                return Some(dialog);
+        for _ in 0..3 {
+            press(window, VK_L);
+            let deadline = Instant::now() + Duration::from_secs(2);
+            while Instant::now() < deadline {
+                if let Some(dialog) = self::window(pid, "#32770") {
+                    return Some(dialog);
+                }
+                std::thread::sleep(Duration::from_millis(50));
             }
-            std::thread::sleep(Duration::from_millis(50));
         }
         None
     }

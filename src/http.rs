@@ -120,7 +120,8 @@ impl Http {
             })
             .max();
         if let Some(reset) = reset {
-            let wait = Duration::from_secs(reset.saturating_sub(now));
+            // A second past the reset: Metron's own count can still be full right at it.
+            let wait = Duration::from_secs(reset.saturating_sub(now) + 1);
             log!("{} rate limit used up, next request in {wait:?}", host.key);
             self.pause(host, wait);
         }

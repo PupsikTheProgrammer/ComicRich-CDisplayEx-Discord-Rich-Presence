@@ -1,4 +1,4 @@
-# ComicRich — Discord Rich Presence для CDisplayEx
+# ComicRich - CDisplayEx Discord Rich Presence
 
 [English](README.md) · **Русский**
 
@@ -183,3 +183,7 @@ cargo test --test e2e -- --ignored --nocapture --test-threads=1
 Данные о комиксах и обложки — из [Metron](https://metron.cloud) и
 [Comic Vine](https://comicvine.gamespot.com/). ComicRich не связан с CDisplayEx, Discord, Metron
 или Comic Vine.
+
+## Лицензия
+
+[MIT](LICENSE)

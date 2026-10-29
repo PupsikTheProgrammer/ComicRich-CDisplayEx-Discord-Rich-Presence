@@ -1,4 +1,4 @@
-# ComicRich — Discord Rich Presence for CDisplayEx
+# ComicRich - CDisplayEx Discord Rich Presence
 
 **English** · [Русский](README.ru.md)
 
@@ -179,3 +179,7 @@ PDFs.
 Comic data and covers come from [Metron](https://metron.cloud) and
 [Comic Vine](https://comicvine.gamespot.com/). ComicRich is not affiliated with CDisplayEx,
 Discord, Metron or Comic Vine.
+
+## License
+
+[MIT](LICENSE)

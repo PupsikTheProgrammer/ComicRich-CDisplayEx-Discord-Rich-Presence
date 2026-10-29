@@ -2,7 +2,8 @@
 name = "comicrich"
 version = "0.1.0"
 edition = "2021"
-description = "Unofficial Discord Rich Presence companion for CDisplayEx"
+description = "Unofficial Discord Rich Presence companion for the CDisplayEx comic reader"
+license = "MIT"
 publish = false
 
 [dependencies]

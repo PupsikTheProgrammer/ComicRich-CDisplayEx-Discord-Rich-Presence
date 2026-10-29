@@ -10,7 +10,10 @@ language = "ru"
 online = true
 
 # https://metron.cloud — free account. Main database.
+# Preferred: an API token (account page -> API Tokens). Username and password
+# still work but are deprecated by Metron.
 [metron]
+token = ""
 username = ""
 password = ""
 

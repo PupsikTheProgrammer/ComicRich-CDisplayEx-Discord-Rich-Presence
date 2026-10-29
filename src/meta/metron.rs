@@ -1,5 +1,6 @@
-//! Metron (metron.cloud): free, open comic database. Needs a free account;
-//! allows about 30 requests per minute. Each request takes it a second or two,
+//! Metron (metron.cloud): free, open comic database. Needs a free account; allows
+//! 20 requests per minute and 5000 per day per user, and reports what is left in
+//! every response (followed by `Http`). Each request takes it a second or two,
 //! so the cover is reported as soon as the issue is found, and the series a name
 //! stands for is remembered for the following issues.
 
@@ -11,12 +12,13 @@ use serde_json::Value;
 use super::cache::{self, Shared};
 use super::online::{self, pick, query, Candidate, IssueMatch, Source};
 use super::IssueRef;
-use crate::http::{basic_auth, encode, Host, Http};
+use crate::http::{encode, Host, Http};
 use crate::rate::Limit;
 
 const BASE: &str = "https://metron.cloud/api";
-/// One lookup is a burst of up to four requests; stay under the per-minute limit.
-const HOST: Host = Host { key: "metron", limit: Limit::new(25, Duration::from_secs(60)) };
+/// One lookup is a burst of up to four requests; stay under the per-minute limit,
+/// with room for other Metron clients of the same account.
+const HOST: Host = Host { key: "metron", limit: Limit::new(18, Duration::from_secs(60)) };
 
 pub struct Metron {
     base: String,
@@ -40,12 +42,13 @@ struct Series {
 const REFUSED_KEY: &str = "metron refused credentials";
 
 impl Metron {
-    pub fn new(user: &str, password: &str, cache: Shared) -> Self {
-        Self::at(BASE, user, password, cache)
+    /// `auth` is the `Authorization` header value: a bearer token or basic auth.
+    pub fn new(auth: String, cache: Shared) -> Self {
+        Self::at(BASE, auth, cache)
     }
 
-    fn at(base: &str, user: &str, password: &str, cache: Shared) -> Self {
-        let metron = Self { base: base.to_string(), auth: basic_auth(user, password), cache };
+    fn at(base: &str, auth: String, cache: Shared) -> Self {
+        let metron = Self { base: base.to_string(), auth, cache };
         if metron.refused() {
             log!("metron refused these credentials before; skipped until they change in comicrich.toml");
         }
@@ -235,7 +238,7 @@ mod tests {
     fn cover_comes_early_and_series_is_remembered() {
         let server = metron();
         let cache = Arc::new(Mutex::new(Cache::default()));
-        let mut m = Metron::at(&format!("{}/api", server.url), "reader", "secret", cache.clone());
+        let mut m = Metron::at(&format!("{}/api", server.url), "Bearer secret-token".into(), cache.clone());
 
         let (found, cover_after) = lookup(&mut m, &mut Http::new(), &server);
         let found = found.expect("issue found");
@@ -246,9 +249,10 @@ mod tests {
         assert_eq!(found.series_type.as_deref(), Some("Limited Series"));
         assert_eq!(found.issue_count, Some(14));
         assert_eq!(server.requests().len(), 4);
+        assert!(server.authorizations().iter().all(|a| a.as_deref() == Some("Bearer secret-token")), "token not sent");
 
         // The next lookup in the series, in a later run: no series search or details.
-        let mut m = Metron::at(&format!("{}/api", server.url), "reader", "secret", cache);
+        let mut m = Metron::at(&format!("{}/api", server.url), "Bearer secret-token".into(), cache);
         let (found, cover_after) = lookup(&mut m, &mut Http::new(), &server);
         assert_eq!(found.unwrap().issue_count, Some(14));
         assert_eq!(cover_after, Some(5), "cover after a single request");
@@ -262,17 +266,17 @@ mod tests {
         let base = format!("{}/api", server.url);
         let cache = Arc::new(Mutex::new(Cache::default()));
 
-        let mut m = Metron::at(&base, "reader", "wrong", cache.clone());
+        let mut m = Metron::at(&base, "Bearer wrong".into(), cache.clone());
         assert!(lookup(&mut m, &mut Http::new(), &server).0.is_none());
         assert_eq!(server.requests().len(), 1);
 
         // A later run with the same credentials sends nothing.
-        let mut m = Metron::at(&base, "reader", "wrong", cache.clone());
+        let mut m = Metron::at(&base, "Bearer wrong".into(), cache.clone());
         assert!(lookup(&mut m, &mut Http::new(), &server).0.is_none());
         assert_eq!(server.requests().len(), 1);
 
         // Corrected credentials are tried.
-        let mut m = Metron::at(&base, "reader", "right", cache);
+        let mut m = Metron::at(&base, "Bearer right".into(), cache);
         lookup(&mut m, &mut Http::new(), &server);
         assert_eq!(server.requests().len(), 2);
     }

@@ -29,8 +29,25 @@ pub struct Config {
 #[derive(Clone, Debug, Default, Deserialize)]
 #[serde(default)]
 pub struct MetronConfig {
+    /// API token from the account page; preferred over username and password,
+    /// which Metron has deprecated.
+    pub token: String,
     pub username: String,
     pub password: String,
+}
+
+impl MetronConfig {
+    /// The `Authorization` header value, if credentials are set.
+    pub fn authorization(&self) -> Option<String> {
+        let token = self.token.trim();
+        if !token.is_empty() {
+            Some(format!("Bearer {token}"))
+        } else if !self.username.is_empty() && !self.password.is_empty() {
+            Some(crate::http::basic_auth(&self.username, &self.password))
+        } else {
+            None
+        }
+    }
 }
 
 #[derive(Clone, Debug, Default, Deserialize)]
@@ -69,5 +86,22 @@ impl Config {
                 Self::default()
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn metron_token_wins_over_password() {
+        let config: Config = toml::from_str("[metron]\ntoken = \" abc123 \"\nusername = \"u\"\npassword = \"p\"").unwrap();
+        assert_eq!(config.metron.authorization().as_deref(), Some("Bearer abc123"));
+
+        let config: Config = toml::from_str("[metron]\nusername = \"Aladdin\"\npassword = \"open sesame\"").unwrap();
+        assert_eq!(config.metron.authorization().as_deref(), Some("Basic QWxhZGRpbjpvcGVuIHNlc2FtZQ=="));
+
+        let config: Config = toml::from_str("[metron]\nusername = \"only-name\"").unwrap();
+        assert_eq!(config.metron.authorization(), None);
     }
 }

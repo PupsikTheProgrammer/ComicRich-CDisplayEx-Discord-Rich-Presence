@@ -48,8 +48,8 @@ pub fn run(jobs: Receiver<Job>, config: &Config, publish: impl Fn(PathBuf, Arc<C
     let cache: Shared = Arc::new(Mutex::new(Cache::load()));
     let mut sources: Vec<Box<dyn Source>> = Vec::new();
     if config.online {
-        if !config.metron.username.is_empty() && !config.metron.password.is_empty() {
-            sources.push(Box::new(Metron::new(&config.metron.username, &config.metron.password, cache.clone())));
+        if let Some(auth) = config.metron.authorization() {
+            sources.push(Box::new(Metron::new(auth, cache.clone())));
         }
         if !config.comicvine.api_key.is_empty() {
             sources.push(Box::new(ComicVine::new(&config.comicvine.api_key)));

@@ -2,7 +2,7 @@
 
 use std::collections::{HashMap, HashSet};
 use std::io::Read;
-use std::time::{Duration, Instant};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use serde_json::Value;
 
@@ -15,13 +15,16 @@ const TIMEOUT: Duration = Duration::from_secs(20);
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(3);
 /// How long an unreachable host is skipped, so lookups go straight to the next source.
 const DOWN_FOR: Duration = Duration::from_secs(300);
-const MAX_RETRY_WAIT: u64 = 60;
+/// The longest a lookup waits for a rate limit; beyond that the host is skipped.
+const MAX_WAIT: Duration = Duration::from_secs(60);
 
 pub struct Http {
     agent: ureq::Agent,
     windows: HashMap<&'static str, Window>,
-    /// Unreachable hosts and when to try them again.
+    /// Unreachable or rate-limited hosts and when to try them again.
     down: HashMap<&'static str, Instant>,
+    /// Hosts whose rate limit is spent, and when the next request may go.
+    paused: HashMap<&'static str, Instant>,
     /// Hosts that refused the credentials. Repeated bad logins get an address
     /// banned (Metron jails it), so they are not asked again.
     rejected: HashSet<&'static str>,
@@ -41,7 +44,7 @@ impl Http {
             .timeout_connect(CONNECT_TIMEOUT)
             .user_agent(USER_AGENT)
             .build();
-        Self { agent, windows: HashMap::new(), down: HashMap::new(), rejected: HashSet::new() }
+        Self { agent, windows: HashMap::new(), down: HashMap::new(), paused: HashMap::new(), rejected: HashSet::new() }
     }
 
     pub fn json(&mut self, host: Host, url: &str, auth: Option<&str>) -> Option<Value> {
@@ -72,11 +75,16 @@ impl Http {
                 request = request.set("Authorization", auth);
             }
             match request.call() {
-                Ok(r) => return Some(r),
-                Err(ureq::Error::Status(429, r)) if attempt == 0 => {
-                    let wait = r.header("Retry-After").and_then(|s| s.parse().ok()).unwrap_or(30);
-                    log!("rate limited by {}, waiting {wait}s", host.key);
-                    std::thread::sleep(Duration::from_secs(wait.min(MAX_RETRY_WAIT)));
+                Ok(r) => {
+                    self.follow_limits(host, &r);
+                    return Some(r);
+                }
+                Err(ureq::Error::Status(429, r)) => {
+                    let wait = Duration::from_secs(r.header("Retry-After").and_then(|s| s.parse().ok()).unwrap_or(30));
+                    log!("rate limited by {}, asked to wait {wait:?}", host.key);
+                    if attempt > 0 || !self.pause(host, wait) {
+                        return None;
+                    }
                 }
                 Err(ureq::Error::Status(code @ (401 | 403), _)) => {
                     log!("{} refused the credentials (HTTP {code}), not asking it again; check comicrich.toml", host.key);
@@ -99,7 +107,42 @@ impl Http {
         None
     }
 
+    /// Follows rate limit headers (Metron's `X-RateLimit-{Burst,Sustained}-*`):
+    /// once a budget is spent, the next request waits for it to reset.
+    fn follow_limits(&mut self, host: Host, r: &ureq::Response) {
+        let now = SystemTime::now().duration_since(UNIX_EPOCH).map_or(0, |d| d.as_secs());
+        let reset = ["Burst", "Sustained"]
+            .iter()
+            .filter_map(|kind| {
+                let remaining: u64 = r.header(&format!("X-RateLimit-{kind}-Remaining"))?.parse().ok()?;
+                let reset: u64 = r.header(&format!("X-RateLimit-{kind}-Reset"))?.parse().ok()?;
+                (remaining == 0).then_some(reset)
+            })
+            .max();
+        if let Some(reset) = reset {
+            let wait = Duration::from_secs(reset.saturating_sub(now));
+            log!("{} rate limit used up, next request in {wait:?}", host.key);
+            self.pause(host, wait);
+        }
+    }
+
+    /// Holds requests to `host` for `wait`; a long wait skips the host instead,
+    /// so lookups go to the next source. Returns whether requests will wait.
+    fn pause(&mut self, host: Host, wait: Duration) -> bool {
+        if wait <= MAX_WAIT {
+            self.paused.insert(host.key, Instant::now() + wait);
+            true
+        } else {
+            log!("{} not asked again for {wait:?}", host.key);
+            self.down.insert(host.key, Instant::now() + wait);
+            false
+        }
+    }
+
     fn pace(&mut self, host: Host) {
+        if let Some(until) = self.paused.remove(host.key) {
+            std::thread::sleep(until.saturating_duration_since(Instant::now()));
+        }
         let window = self.windows.entry(host.key).or_default();
         let wait = window.wait(host.limit, Instant::now());
         if !wait.is_zero() {
@@ -160,19 +203,30 @@ pub mod fake {
     pub struct Server {
         /// `http://127.0.0.1:<port>`
         pub url: String,
-        requests: Arc<Mutex<Vec<String>>>,
+        /// Path (with query) and `Authorization` header of each request.
+        requests: Arc<Mutex<Vec<(String, Option<String>)>>>,
     }
 
     impl Server {
         /// Paths (with queries) requested so far, in order.
         pub fn requests(&self) -> Vec<String> {
-            self.requests.lock().unwrap().clone()
+            self.requests.lock().unwrap().iter().map(|(p, _)| p.clone()).collect()
+        }
+
+        /// The `Authorization` header of each request, in order.
+        pub fn authorizations(&self) -> Vec<Option<String>> {
+            self.requests.lock().unwrap().iter().map(|(_, a)| a.clone()).collect()
         }
     }
 
     /// Answers each request from the first route whose path prefix matches it,
     /// with that status and JSON body; anything else gets 404.
     pub fn serve(routes: Vec<(&'static str, u16, String)>) -> Server {
+        serve_with_headers(routes.into_iter().map(|(p, s, b)| (p, s, String::new(), b)).collect())
+    }
+
+    /// As `serve`, with extra response header lines (`Name: value\r\n` each).
+    pub fn serve_with_headers(routes: Vec<(&'static str, u16, String, String)>) -> Server {
         let listener = TcpListener::bind("127.0.0.1:0").unwrap();
         let url = format!("http://{}", listener.local_addr().unwrap());
         let requests = Arc::new(Mutex::new(Vec::new()));
@@ -184,13 +238,17 @@ pub mod fake {
                 let n = stream.read(&mut buf).unwrap_or(0);
                 let head = String::from_utf8_lossy(&buf[..n]);
                 let path = head.split_whitespace().nth(1).unwrap_or("").to_string();
-                log.lock().unwrap().push(path.clone());
-                let (status, body) = routes
+                let auth = head
+                    .lines()
+                    .find_map(|l| l.split_once(':').filter(|(k, _)| k.eq_ignore_ascii_case("authorization")))
+                    .map(|(_, v)| v.trim().to_string());
+                log.lock().unwrap().push((path.clone(), auth));
+                let (status, headers, body) = routes
                     .iter()
-                    .find(|(prefix, _, _)| path.starts_with(prefix))
-                    .map_or((404, String::new()), |(_, s, b)| (*s, b.clone()));
+                    .find(|(prefix, ..)| path.starts_with(prefix))
+                    .map_or((404, String::new(), String::new()), |(_, s, h, b)| (*s, h.clone(), b.clone()));
                 let reply = format!(
-                    "HTTP/1.1 {status} Status\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                    "HTTP/1.1 {status} Status\r\nContent-Type: application/json\r\nContent-Length: {}\r\n{headers}Connection: close\r\n\r\n{body}",
                     body.len()
                 );
                 let _ = stream.write_all(reply.as_bytes());
@@ -241,6 +299,48 @@ mod tests {
         }
         assert!(http.rejected(host));
         assert_eq!(server.requests().len(), 1, "credentials were sent again after a 401");
+    }
+
+    fn unix_in(secs: u64) -> u64 {
+        SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_secs() + secs
+    }
+
+    #[test]
+    fn spent_burst_budget_waits_for_its_reset() {
+        let headers = format!("X-RateLimit-Burst-Remaining: 0\r\nX-RateLimit-Burst-Reset: {}\r\n", unix_in(2));
+        let server = fake::serve_with_headers(vec![("/", 200, headers, "{}".into())]);
+        let host = Host { key: "budget", limit: Limit::NONE };
+        let mut http = Http::new();
+        let started = Instant::now();
+        assert!(http.json(host, &server.url, None).is_some());
+        assert!(http.json(host, &server.url, None).is_some());
+        assert!(started.elapsed() >= Duration::from_millis(900), "did not wait for the reset");
+        assert_eq!(server.requests().len(), 2);
+    }
+
+    #[test]
+    fn spent_daily_budget_skips_the_host() {
+        let headers = format!("X-RateLimit-Sustained-Remaining: 0\r\nX-RateLimit-Sustained-Reset: {}\r\n", unix_in(3600));
+        let server = fake::serve_with_headers(vec![("/", 200, headers, "{}".into())]);
+        let host = Host { key: "daily", limit: Limit::NONE };
+        let mut http = Http::new();
+        assert!(http.json(host, &server.url, None).is_some());
+        let started = Instant::now();
+        assert!(http.json(host, &server.url, None).is_none());
+        assert!(started.elapsed() < Duration::from_millis(50));
+        assert_eq!(server.requests().len(), 1);
+    }
+
+    #[test]
+    fn long_retry_after_skips_the_host() {
+        let server = fake::serve_with_headers(vec![("/", 429, "Retry-After: 600\r\n".into(), String::new())]);
+        let host = Host { key: "throttled", limit: Limit::NONE };
+        let mut http = Http::new();
+        let started = Instant::now();
+        assert!(http.json(host, &server.url, None).is_none());
+        assert!(http.json(host, &server.url, None).is_none());
+        assert!(started.elapsed() < Duration::from_secs(1), "waited for a long Retry-After");
+        assert_eq!(server.requests().len(), 1);
     }
 
     #[test]

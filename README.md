@@ -6,10 +6,7 @@ An unofficial companion for the [CDisplayEx](https://www.cdisplayex.com/) comic 
 in Discord what you are reading: the cover, the title, the issue and the page — and, in collected
 editions, which issue inside the collection you are on.
 
-```
-Watching  Runaways #7: Rock Zombies: Part One
-          Runaways Vol. 3 (2009) · Page 1 of 24
-```
+![Discord status: Watching ComicRich — Runaways #1: Pride and Joy, Runaways Vol. 1 (2003) · Page 17](docs/discord-status.png)
 
 ComicRich starts by itself when you double-click a comic and exits 15 seconds after the last
 CDisplayEx window closes. When you are not reading, it is not running at all.

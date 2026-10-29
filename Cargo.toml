@@ -4,6 +4,7 @@ version = "0.1.0"
 edition = "2021"
 description = "Unofficial Discord Rich Presence companion for the CDisplayEx comic reader"
 license = "MIT"
+repository = "https://github.com/PupsikTheProgrammer/ComicRich-CDisplayEx-Discord-Rich-Presence"
 publish = false
 
 [dependencies]

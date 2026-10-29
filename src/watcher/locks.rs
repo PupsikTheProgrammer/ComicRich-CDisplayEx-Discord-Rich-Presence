@@ -4,13 +4,18 @@
 //! the menu is found in the process handle table: CDisplayEx keeps an archive open
 //! only while loading it (~200 ms), and its window title switches to the first page
 //! inside that span, so a snapshot taken right after the title event names the
-//! file. The snapshot covers only that process and takes a millisecond or two.
+//! file. PDFs are read by a helper child process, `pdfreader.exe`, which holds the
+//! file for about half a second before the title changes, so children are
+//! included. A snapshot takes a millisecond or two.
 
 use std::ffi::c_void;
 use std::path::PathBuf;
 
-use windows_sys::Win32::Foundation::{CloseHandle, DuplicateHandle, DUPLICATE_SAME_ACCESS, HANDLE};
+use windows_sys::Win32::Foundation::{CloseHandle, DuplicateHandle, DUPLICATE_SAME_ACCESS, HANDLE, INVALID_HANDLE_VALUE};
 use windows_sys::Win32::Storage::FileSystem::{GetFileType, GetFinalPathNameByHandleW, FILE_TYPE_DISK};
+use windows_sys::Win32::System::Diagnostics::ToolHelp::{
+    CreateToolhelp32Snapshot, Process32FirstW, Process32NextW, PROCESSENTRY32W, TH32CS_SNAPPROCESS,
+};
 use windows_sys::Win32::System::Threading::{
     GetCurrentProcess, OpenProcess, PROCESS_DUP_HANDLE, PROCESS_QUERY_INFORMATION, PROCESS_QUERY_LIMITED_INFORMATION,
 };
@@ -20,6 +25,8 @@ use crate::win::from_wide;
 const PROCESS_HANDLE_SNAPSHOT_INFORMATION: u32 = 51;
 const PROCESS_COMMAND_LINE_INFORMATION: u32 = 60;
 const STATUS_INFO_LENGTH_MISMATCH: i32 = 0xC000_0004_u32 as i32;
+/// The window is closing; nothing to report.
+const STATUS_PROCESS_IS_TERMINATING: i32 = 0xC000_010A_u32 as i32;
 const COMIC_EXTENSIONS: &[&str] = &["cbz", "cbr", "zip", "rar", "pdf", "cb7", "7z"];
 
 #[repr(C)]
@@ -45,8 +52,12 @@ extern "system" {
         -> i32;
 }
 
-/// Comic files currently open in the given process.
+/// Comic files currently open in the given process or its child processes.
 pub fn open_comics(pid: u32) -> Vec<PathBuf> {
+    std::iter::once(pid).chain(children(pid)).flat_map(process_comics).collect()
+}
+
+fn process_comics(pid: u32) -> Vec<PathBuf> {
     unsafe {
         let process = OpenProcess(PROCESS_QUERY_INFORMATION | PROCESS_DUP_HANDLE, 0, pid);
         if process.is_null() {
@@ -56,6 +67,27 @@ pub fn open_comics(pid: u32) -> Vec<PathBuf> {
         CloseHandle(process);
         files.into_iter().filter(|p| is_comic(p)).collect()
     }
+}
+
+fn children(pid: u32) -> Vec<u32> {
+    let mut found = Vec::new();
+    unsafe {
+        let snapshot = CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0);
+        if snapshot == INVALID_HANDLE_VALUE {
+            return found;
+        }
+        let mut entry: PROCESSENTRY32W = std::mem::zeroed();
+        entry.dwSize = size_of::<PROCESSENTRY32W>() as u32;
+        let mut ok = Process32FirstW(snapshot, &mut entry);
+        while ok != 0 {
+            if entry.th32ParentProcessID == pid && entry.th32ProcessID != pid {
+                found.push(entry.th32ProcessID);
+            }
+            ok = Process32NextW(snapshot, &mut entry);
+        }
+        CloseHandle(snapshot);
+    }
+    found
 }
 
 /// The comic passed on the command line (double-click in Explorer), if any.
@@ -114,7 +146,9 @@ unsafe fn handle_paths(process: HANDLE) -> Vec<PathBuf> {
             continue;
         }
         if status < 0 {
-            log!("handle snapshot failed: {status:#x}");
+            if status != STATUS_PROCESS_IS_TERMINATING {
+                log!("handle snapshot failed: {status:#x}");
+            }
             return Vec::new();
         }
         break;

@@ -131,18 +131,20 @@ impl Engine {
     /// CDisplayEx wrote its registry, as it does on leaving a comic: watch the
     /// windows showing one for a switch to another file.
     fn on_registry(&mut self) {
-        if self.windows.values().any(|s| matches!(s, Shown::Comic(_))) {
+        if !self.windows.is_empty() {
             self.watch_until = Some(Instant::now() + SWITCH_WATCH);
             self.check_switches();
         }
     }
 
     fn check_switches(&mut self) {
-        let pids: Vec<u32> =
-            self.windows.iter().filter(|(_, s)| matches!(s, Shown::Comic(_))).map(|(&pid, _)| pid).collect();
+        let pids: Vec<u32> = self.windows.keys().copied().collect();
         for pid in pids {
             let title = self.titles.get(&pid).cloned().unwrap_or_default();
             if let Some(r) = self.resolver.switched(pid, &title) {
+                if self.pending.as_ref().is_some_and(|p| p.pid == pid) {
+                    self.pending = None;
+                }
                 self.touch(pid);
                 let shown = self.show_comic(r);
                 self.windows.insert(pid, shown);

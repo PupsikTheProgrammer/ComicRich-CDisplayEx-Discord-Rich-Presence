@@ -19,6 +19,7 @@ const BASE: &str = "https://metron.cloud/api";
 const HOST: Host = Host { key: "metron", limit: Limit::new(25, Duration::from_secs(60)) };
 
 pub struct Metron {
+    base: String,
     auth: String,
     cache: Shared,
 }
@@ -34,13 +35,46 @@ struct Series {
     issue_count: Option<u32>,
 }
 
+/// Remembers refused credentials across runs: Metron bans an address that keeps
+/// sending bad logins, so they are not tried again until they change.
+const REFUSED_KEY: &str = "metron refused credentials";
+
 impl Metron {
     pub fn new(user: &str, password: &str, cache: Shared) -> Self {
-        Self { auth: basic_auth(user, password), cache }
+        Self::at(BASE, user, password, cache)
+    }
+
+    fn at(base: &str, user: &str, password: &str, cache: Shared) -> Self {
+        let metron = Self { base: base.to_string(), auth: basic_auth(user, password), cache };
+        if metron.refused() {
+            log!("metron refused these credentials before; skipped until they change in comicrich.toml");
+        }
+        metron
+    }
+
+    /// A fingerprint of the credentials, so the password itself is not stored.
+    fn fingerprint(&self) -> u64 {
+        use std::hash::{Hash, Hasher};
+        let mut h = std::collections::hash_map::DefaultHasher::new();
+        self.auth.hash(&mut h);
+        h.finish()
+    }
+
+    fn refused(&self) -> bool {
+        cache::lock(&self.cache).lookup(REFUSED_KEY).and_then(Value::as_u64) == Some(self.fingerprint())
     }
 
     fn get(&self, http: &mut Http, path: &str) -> Option<Value> {
-        http.json(HOST, &format!("{BASE}{path}"), Some(&self.auth))
+        if self.refused() {
+            return None;
+        }
+        let v = http.json(HOST, &format!("{}{path}", self.base), Some(&self.auth));
+        if http.rejected(HOST) {
+            let mut cache = cache::lock(&self.cache);
+            cache.set_lookup(REFUSED_KEY.into(), Value::from(self.fingerprint()));
+            cache.save();
+        }
+        v
     }
 
     fn series(&self, http: &mut Http, name: &str, year: Option<u32>, volume: Option<u32>) -> Option<Candidate<u64>> {
@@ -156,4 +190,90 @@ fn text(v: &Value) -> Option<String> {
 
 fn u32_of(v: &Value) -> Option<u32> {
     v.as_u64().and_then(|n| u32::try_from(n).ok())
+}
+
+#[cfg(test)]
+mod tests {
+    use std::sync::{Arc, Mutex};
+
+    use super::*;
+    use crate::http::fake;
+    use crate::meta::cache::Cache;
+
+    const COVER: &str = "https://static.metron.cloud/media/issue/2024/06/09/runaways-v3-9.jpg";
+
+    /// Metron's answers for "Runaways" vol. 3, in the shape of its API.
+    fn metron() -> fake::Server {
+        let series_list = r#"{"count":3,"results":[
+            {"id":101,"series":"Runaways (2003)","year_began":2003,"volume":1,"issue_count":18},
+            {"id":102,"series":"Runaways (2005)","year_began":2005,"volume":2,"issue_count":30},
+            {"id":103,"series":"Runaways (2008)","year_began":2008,"volume":3,"issue_count":14}]}"#;
+        let issue_list = format!(r#"{{"count":1,"results":[{{"id":9009,"number":"9","image":"{COVER}"}}]}}"#);
+        let issue = format!(
+            r#"{{"id":9009,"number":"9","name":["Rock Zombies: Conclusion"],"title":"","image":"{COVER}",
+                "series":{{"id":103,"name":"Runaways","series_type":{{"name":"Ongoing Series"}}}},"reprints":[]}}"#
+        );
+        let series = r#"{"id":103,"name":"Runaways","series_type":{"name":"Limited Series"},"issue_count":14}"#;
+        fake::serve(vec![
+            ("/api/series/?", 200, series_list.into()),
+            ("/api/series/103/", 200, series.into()),
+            ("/api/issue/?series_id=103", 200, issue_list),
+            ("/api/issue/9009/", 200, issue),
+        ])
+    }
+
+    fn lookup(m: &mut Metron, http: &mut Http, server: &fake::Server) -> (Option<IssueMatch>, Option<usize>) {
+        let mut cover_after = None;
+        let found = m.issue(http, "Runaways", Some(2009), Some(3), "9", &mut |c| {
+            assert_eq!(c, COVER);
+            cover_after = Some(server.requests().len());
+        });
+        (found, cover_after)
+    }
+
+    #[test]
+    fn cover_comes_early_and_series_is_remembered() {
+        let server = metron();
+        let cache = Arc::new(Mutex::new(Cache::default()));
+        let mut m = Metron::at(&format!("{}/api", server.url), "reader", "secret", cache.clone());
+
+        let (found, cover_after) = lookup(&mut m, &mut Http::new(), &server);
+        let found = found.expect("issue found");
+        assert_eq!(cover_after, Some(2), "cover reported right after the issue list");
+        assert_eq!((found.series.as_str(), found.year, found.volume), ("Runaways", Some(2008), Some(3)));
+        assert_eq!(found.title.as_deref(), Some("Rock Zombies: Conclusion"));
+        assert_eq!(found.cover.as_deref(), Some(COVER));
+        assert_eq!(found.series_type.as_deref(), Some("Limited Series"));
+        assert_eq!(found.issue_count, Some(14));
+        assert_eq!(server.requests().len(), 4);
+
+        // The next lookup in the series, in a later run: no series search or details.
+        let mut m = Metron::at(&format!("{}/api", server.url), "reader", "secret", cache);
+        let (found, cover_after) = lookup(&mut m, &mut Http::new(), &server);
+        assert_eq!(found.unwrap().issue_count, Some(14));
+        assert_eq!(cover_after, Some(5), "cover after a single request");
+        let later = &server.requests()[4..];
+        assert!(later.iter().all(|p| p.starts_with("/api/issue/")), "series looked up again: {later:?}");
+    }
+
+    #[test]
+    fn refused_credentials_are_remembered_across_runs() {
+        let server = fake::serve(vec![("/", 401, String::new())]);
+        let base = format!("{}/api", server.url);
+        let cache = Arc::new(Mutex::new(Cache::default()));
+
+        let mut m = Metron::at(&base, "reader", "wrong", cache.clone());
+        assert!(lookup(&mut m, &mut Http::new(), &server).0.is_none());
+        assert_eq!(server.requests().len(), 1);
+
+        // A later run with the same credentials sends nothing.
+        let mut m = Metron::at(&base, "reader", "wrong", cache.clone());
+        assert!(lookup(&mut m, &mut Http::new(), &server).0.is_none());
+        assert_eq!(server.requests().len(), 1);
+
+        // Corrected credentials are tried.
+        let mut m = Metron::at(&base, "reader", "right", cache);
+        lookup(&mut m, &mut Http::new(), &server);
+        assert_eq!(server.requests().len(), 2);
+    }
 }

@@ -82,9 +82,9 @@ impl Resolver {
     /// name a page the current comic has too, so it is caught by the file
     /// CDisplayEx holds open while loading. `title` is the window's current title.
     pub fn switched(&mut self, pid: u32, title: &str) -> Option<Resolved> {
-        let (current, _) = self.current.get(&pid)?;
-        let current = current.clone();
-        let path = locks::open_comics(pid).into_iter().find(|p| !p.as_os_str().eq_ignore_ascii_case(current.as_os_str()))?;
+        let current = self.current.get(&pid).map(|(p, _)| p.clone());
+        let is_current = |p: &Path| current.as_ref().is_some_and(|c| p.as_os_str().eq_ignore_ascii_case(c.as_os_str()));
+        let path = locks::open_comics(pid).into_iter().find(|p| !is_current(p))?;
         let listing = self.listing(&path)?;
         // The title may still be the old comic's; a new one follows if the page differs.
         let page = listing.find(title).or_else(|| saved_page(&path, &listing)).unwrap_or(0);

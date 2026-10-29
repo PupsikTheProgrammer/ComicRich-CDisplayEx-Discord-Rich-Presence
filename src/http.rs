@@ -1,6 +1,6 @@
 //! Blocking HTTP with per-host rate limits, used only from background threads.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::io::Read;
 use std::time::{Duration, Instant};
 
@@ -22,6 +22,9 @@ pub struct Http {
     windows: HashMap<&'static str, Window>,
     /// Unreachable hosts and when to try them again.
     down: HashMap<&'static str, Instant>,
+    /// Hosts that refused the credentials. Repeated bad logins get an address
+    /// banned (Metron jails it), so they are not asked again.
+    rejected: HashSet<&'static str>,
 }
 
 /// A host and how many requests it accepts.
@@ -38,7 +41,7 @@ impl Http {
             .timeout_connect(CONNECT_TIMEOUT)
             .user_agent(USER_AGENT)
             .build();
-        Self { agent, windows: HashMap::new(), down: HashMap::new() }
+        Self { agent, windows: HashMap::new(), down: HashMap::new(), rejected: HashSet::new() }
     }
 
     pub fn json(&mut self, host: Host, url: &str, auth: Option<&str>) -> Option<Value> {
@@ -53,8 +56,13 @@ impl Http {
         Some(data)
     }
 
+    /// Whether `host` refused the credentials.
+    pub fn rejected(&self, host: Host) -> bool {
+        self.rejected.contains(host.key)
+    }
+
     fn call(&mut self, host: Host, url: &str, auth: Option<&str>) -> Option<ureq::Response> {
-        if self.down.get(host.key).is_some_and(|&until| Instant::now() < until) {
+        if self.rejected.contains(host.key) || self.down.get(host.key).is_some_and(|&until| Instant::now() < until) {
             return None;
         }
         for attempt in 0..2 {
@@ -69,6 +77,11 @@ impl Http {
                     let wait = r.header("Retry-After").and_then(|s| s.parse().ok()).unwrap_or(30);
                     log!("rate limited by {}, waiting {wait}s", host.key);
                     std::thread::sleep(Duration::from_secs(wait.min(MAX_RETRY_WAIT)));
+                }
+                Err(ureq::Error::Status(code @ (401 | 403), _)) => {
+                    log!("{} refused the credentials (HTTP {code}), not asking it again; check comicrich.toml", host.key);
+                    self.rejected.insert(host.key);
+                    return None;
                 }
                 Err(ureq::Error::Transport(t))
                     if matches!(t.kind(), ureq::ErrorKind::Dns | ureq::ErrorKind::ConnectionFailed | ureq::ErrorKind::Io) =>
@@ -137,6 +150,57 @@ fn redact(url: &str) -> String {
 }
 
 #[cfg(test)]
+pub mod fake {
+    //! A local HTTP server standing in for a comic database in tests.
+
+    use std::io::{Read, Write};
+    use std::net::TcpListener;
+    use std::sync::{Arc, Mutex};
+
+    pub struct Server {
+        /// `http://127.0.0.1:<port>`
+        pub url: String,
+        requests: Arc<Mutex<Vec<String>>>,
+    }
+
+    impl Server {
+        /// Paths (with queries) requested so far, in order.
+        pub fn requests(&self) -> Vec<String> {
+            self.requests.lock().unwrap().clone()
+        }
+    }
+
+    /// Answers each request from the first route whose path prefix matches it,
+    /// with that status and JSON body; anything else gets 404.
+    pub fn serve(routes: Vec<(&'static str, u16, String)>) -> Server {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let url = format!("http://{}", listener.local_addr().unwrap());
+        let requests = Arc::new(Mutex::new(Vec::new()));
+        let log = requests.clone();
+        std::thread::spawn(move || {
+            for stream in listener.incoming() {
+                let Ok(mut stream) = stream else { continue };
+                let mut buf = vec![0u8; 8192];
+                let n = stream.read(&mut buf).unwrap_or(0);
+                let head = String::from_utf8_lossy(&buf[..n]);
+                let path = head.split_whitespace().nth(1).unwrap_or("").to_string();
+                log.lock().unwrap().push(path.clone());
+                let (status, body) = routes
+                    .iter()
+                    .find(|(prefix, _, _)| path.starts_with(prefix))
+                    .map_or((404, String::new()), |(_, s, b)| (*s, b.clone()));
+                let reply = format!(
+                    "HTTP/1.1 {status} Status\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                    body.len()
+                );
+                let _ = stream.write_all(reply.as_bytes());
+            }
+        });
+        Server { url, requests }
+    }
+}
+
+#[cfg(test)]
 mod tests {
     use super::*;
 
@@ -165,6 +229,18 @@ mod tests {
         assert!(started.elapsed() < Duration::from_millis(50), "second request was attempted");
         // Other hosts are unaffected.
         assert!(!http.down.contains_key("other"));
+    }
+
+    #[test]
+    fn refused_credentials_are_not_sent_again() {
+        let server = fake::serve(vec![("/", 401, String::new())]);
+        let host = Host { key: "strict", limit: Limit::NONE };
+        let mut http = Http::new();
+        for _ in 0..3 {
+            assert!(http.json(host, &format!("{}/api/", server.url), Some("Basic bad")).is_none());
+        }
+        assert!(http.rejected(host));
+        assert_eq!(server.requests().len(), 1, "credentials were sent again after a 401");
     }
 
     #[test]
